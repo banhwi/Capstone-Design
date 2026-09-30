@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>스마트 창문 제어</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; padding: 50px; }
+        .card { border: 1px solid #ccc; padding: 20px; border-radius: 10px; margin-bottom: 20px; }
+        .sensor-row { margin: 10px 0; font-size: 18px; }
+        button { padding: 10px 20px; margin: 5px; cursor: pointer; font-size: 16px; }
+        #alertBox { display: none; color: white; background-color: red; padding: 10px; font-weight: bold; margin-bottom: 20px; }
+        .rain-warning { color: blue; font-weight: bold; } 
+        /* 슬라이더 디자인 */
+        input[type=range] { width: 60%; margin: 15px 0; }
+    </style>
+</head>
+<body>
+    <h2>스마트 홈 대시보드</h2>
+    
+    <!-- 외부 위험 알림창 -->
+    <div id="alertBox">⚠️ 긴급: 과부하 위험 감지! 시스템을 보호합니다.</div>
+
+    <!-- 센서 데이터 표시 영역 -->
+    <div class="card">
+        <h3>실내외 온습도 및 환경 수치</h3>
+        <div class="sensor-row">
+            🏠 <strong>[실내]</strong> 온도: <span id="inTempDisplay">--</span> °C | 습도: <span id="inHumDisplay">--</span> %
+        </div>
+        <div class="sensor-row">
+            ☁️ <strong>[실외]</strong> 온도: <span id="outTempDisplay">--</span> °C | 습도: <span id="outHumDisplay">--</span> %
+        </div>
+        <div class="sensor-row">
+            🌬️ 미세먼지: <span id="dustDisplay">--</span> μg/m³
+        </div>
+        <div class="sensor-row">
+            🌧️ 강우 상태: <span id="rainDisplay">--</span>
+        </div>
+        <br>
+        <p>현재 창문 상태: <strong id="stateDisplay" style="font-size: 20px;">알 수 없음</strong></p>
+    </div>
+
+    <!-- 임계치 튜닝 영역 (추가된 부분) -->
+    <div class="card">
+        <h3>자동 개폐 임계치 튜닝</h3>
+        <p>미세먼지 허용 기준: <strong id="thresholdView" style="color: green;">35</strong> μg/m³</p>
+        <!-- 최소 10부터 최대 100까지, 5단위로만 움직이도록 강제함 -->
+        <input type="range" id="dustSlider" min="10" max="100" step="5" value="35" oninput="updateSliderText(this.value)">
+        <br>
+        <button onclick="sendThreshold()">설정 적용</button>
+    </div>
+
+    <!-- 창문 수동 제어 버튼 영역 -->
+    <div class="card">
+        <h3>수동 제어</h3>
+        <button onclick="sendCommand('OPEN')">창문 열기</button>
+        <button onclick="sendCommand('CLOSE')">창문 닫기</button>
+        <button onclick="sendCommand('AUTO')">자동 모드</button>
+    </div>
+
+    <script>
+        // 가짜 데이터 양식
+        let mockData = {
+            "indoor_temp": 23.5,
+            "indoor_hum": 48.0,
+            "outdoor_temp": 18.2,
+            "outdoor_hum": 62.0,
+            "dust": 40,
+            "rain_detected": false,
+            "window_state": "CLOSED",
+            "fault_alert": 0
+        };
+
+        // 1. 화면 업데이트 함수
+        function updateDashboard() {
+            document.getElementById("inTempDisplay").innerText = mockData.indoor_temp;
+            document.getElementById("inHumDisplay").innerText = mockData.indoor_hum;
+            document.getElementById("outTempDisplay").innerText = mockData.outdoor_temp;
+            document.getElementById("outHumDisplay").innerText = mockData.outdoor_hum;
+            document.getElementById("dustDisplay").innerText = mockData.dust;
+            
+            let rainSpan = document.getElementById("rainDisplay");
+            if (mockData.rain_detected === true) {
+                rainSpan.innerText = "비 감지됨 🌧️";
+                rainSpan.className = "rain-warning";
+            } else {
+                rainSpan.innerText = "맑음 ☀️";
+                rainSpan.className = "";
+            }
+
+            document.getElementById("stateDisplay").innerText = mockData.window_state;
+
+            if (mockData.fault_alert === 1) {
+                document.getElementById("alertBox").style.display = "block";
+            } else {
+                document.getElementById("alertBox").style.display = "none";
+            }
+        }
+
+        // 2. 수동 제어 명령어 전송
+        function sendCommand(cmd) {
+            console.log("제어 명령 전송:", cmd);
+            alert("명령 전송: " + cmd); 
+            mockData.window_state = cmd; 
+            updateDashboard(); 
+        }
+
+        // 3. 슬라이더 바를 움직일 때 실시간으로 숫자만 바꿔주는 함수
+        function updateSliderText(val) {
+            document.getElementById("thresholdView").innerText = val;
+        }
+
+        // 4. [설정 적용] 버튼을 눌렀을 때 서버로 임계치 데이터를 쏘는 함수
+        function sendThreshold() {
+            let targetValue = document.getElementById("dustSlider").value;
+            console.log("임계치 전송:", targetValue);
+            
+            // 아두이노로 보낼 가상의 JSON 패킷 생성
+            let payload = { "set_dust": parseInt(targetValue) };
+            alert("아두이노로 전송될 데이터: " + JSON.stringify(payload));
+        }
+
+        // 최초 실행
+        updateDashboard();
+    </script>
+</body>
+</html>
