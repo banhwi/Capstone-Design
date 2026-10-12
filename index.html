@@ -39,11 +39,10 @@
         <p>현재 창문 상태: <strong id="stateDisplay" style="font-size: 20px;">알 수 없음</strong></p>
     </div>
 
-    <!-- 임계치 튜닝 영역 (추가된 부분) -->
+    <!-- 임계치 튜닝 영역 -->
     <div class="card">
         <h3>자동 개폐 임계치 튜닝</h3>
         <p>미세먼지 허용 기준: <strong id="thresholdView" style="color: green;">35</strong> μg/m³</p>
-        <!-- 최소 10부터 최대 100까지, 5단위로만 움직이도록 강제함 -->
         <input type="range" id="dustSlider" min="10" max="100" step="5" value="35" oninput="updateSliderText(this.value)">
         <br>
         <button onclick="sendThreshold()">설정 적용</button>
@@ -58,69 +57,86 @@
     </div>
 
     <script>
-        // 가짜 데이터 양식
-        let mockData = {
-            "indoor_temp": 23.5,
-            "indoor_hum": 48.0,
-            "outdoor_temp": 18.2,
-            "outdoor_hum": 62.0,
-            "dust": 40,
-            "rain_detected": false,
-            "window_state": "CLOSED",
-            "fault_alert": 0
-        };
+        // 서버 주소 (플라스크 서버가 동작 중인 주소)
+        // 라즈베리파이 등 외부 기기 접속 시 'http://라즈베리파이IP:5000'으로 변경 필요
+        const SERVER_URL = "http://127.0.0.1:5000";
 
-        // 1. 화면 업데이트 함수
-        function updateDashboard() {
-            document.getElementById("inTempDisplay").innerText = mockData.indoor_temp;
-            document.getElementById("inHumDisplay").innerText = mockData.indoor_hum;
-            document.getElementById("outTempDisplay").innerText = mockData.outdoor_temp;
-            document.getElementById("outHumDisplay").innerText = mockData.outdoor_hum;
-            document.getElementById("dustDisplay").innerText = mockData.dust;
-            
-            let rainSpan = document.getElementById("rainDisplay");
-            if (mockData.rain_detected === true) {
-                rainSpan.innerText = "비 감지됨 🌧️";
-                rainSpan.className = "rain-warning";
-            } else {
-                rainSpan.innerText = "맑음 ☀️";
-                rainSpan.className = "";
-            }
+        // 1. 서버에서 센서 데이터를 가져와 화면을 실시간 업데이트 (GET 방식)
+        async function fetchDashboard() {
+            try {
+                let response = await fetch(SERVER_URL + "/status");
+                if (!response.ok) throw new Error("네트워크 응답 오류");
+                
+                let data = await response.json();
 
-            document.getElementById("stateDisplay").innerText = mockData.window_state;
+                document.getElementById("inTempDisplay").innerText = data.indoor_temp !== undefined ? data.indoor_temp : "--";
+                document.getElementById("inHumDisplay").innerText = data.indoor_hum !== undefined ? data.indoor_hum : "--";
+                document.getElementById("outTempDisplay").innerText = data.outdoor_temp !== undefined ? data.outdoor_temp : "--";
+                document.getElementById("outHumDisplay").innerText = data.outdoor_hum !== undefined ? data.outdoor_hum : "--";
+                document.getElementById("dustDisplay").innerText = data.dust !== undefined ? data.dust : "--";
+                
+                let rainSpan = document.getElementById("rainDisplay");
+                if (data.rain_detected === true) {
+                    rainSpan.innerText = "비 감지됨 🌧️";
+                    rainSpan.className = "rain-warning";
+                } else {
+                    rainSpan.innerText = "맑음 ☀️";
+                    rainSpan.className = "";
+                }
 
-            if (mockData.fault_alert === 1) {
-                document.getElementById("alertBox").style.display = "block";
-            } else {
-                document.getElementById("alertBox").style.display = "none";
+                document.getElementById("stateDisplay").innerText = data.window_state !== undefined ? data.window_state : "알 수 없음";
+
+                if (data.fault_alert === 1) {
+                    document.getElementById("alertBox").style.display = "block";
+                } else {
+                    document.getElementById("alertBox").style.display = "none";
+                }
+            } catch (error) {
+                console.error("서버 연결 실패:", error);
+                // 통신 실패 시 화면 갱신을 멈추거나 에러를 표시할 수 있음
             }
         }
 
-        // 2. 수동 제어 명령어 전송
-        function sendCommand(cmd) {
-            console.log("제어 명령 전송:", cmd);
-            alert("명령 전송: " + cmd); 
-            mockData.window_state = cmd; 
-            updateDashboard(); 
+        // 2. 수동 제어 명령어 전송 (POST 방식)
+        async function sendCommand(cmd) {
+            try {
+                await fetch(SERVER_URL + "/command", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ "cmd": cmd })
+                });
+                console.log("제어 명령 전송 성공:", cmd);
+                fetchDashboard(); // 서버에 명령 전달 후 화면 즉시 동기화
+            } catch (error) {
+                alert("서버 통신 에러! 파이썬 서버가 켜져 있는지 확인하세요.");
+            }
         }
 
-        // 3. 슬라이더 바를 움직일 때 실시간으로 숫자만 바꿔주는 함수
+        // 3. 슬라이더 바 실시간 텍스트 업데이트
         function updateSliderText(val) {
             document.getElementById("thresholdView").innerText = val;
         }
 
-        // 4. [설정 적용] 버튼을 눌렀을 때 서버로 임계치 데이터를 쏘는 함수
-        function sendThreshold() {
+        // 4. [설정 적용] 버튼을 눌렀을 때 서버로 임계치 데이터를 전송 (POST 방식)
+        async function sendThreshold() {
             let targetValue = document.getElementById("dustSlider").value;
-            console.log("임계치 전송:", targetValue);
-            
-            // 아두이노로 보낼 가상의 JSON 패킷 생성
-            let payload = { "set_dust": parseInt(targetValue) };
-            alert("아두이노로 전송될 데이터: " + JSON.stringify(payload));
+            try {
+                await fetch(SERVER_URL + "/command", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ "set_dust": parseInt(targetValue) })
+                });
+                alert("임계치 " + targetValue + " μg/m³ 설정 완료!");
+            } catch (error) {
+                alert("서버 통신 에러! 파이썬 서버가 켜져 있는지 확인하세요.");
+            }
         }
 
-        // 최초 실행
-        updateDashboard();
+        // 5. 1초(1000ms)마다 주기적으로 서버 데이터를 긁어와 화면 갱신 (Polling)
+        setInterval(fetchDashboard, 1000);
+        
+        // 브라우저가 열리자마자 1회 즉시 실행
+        fetchDashboard();
     </script>
 </body>
 </html>
