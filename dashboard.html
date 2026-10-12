@@ -63,6 +63,7 @@
         const SERVER_URL = "";
 
         const STATE_TEXT = { "OPEN": "열림", "CLOSED": "닫힘", "UNKNOWN": "알 수 없음" };
+        let sliderSynced = false; // 서버에 저장된 임계치를 슬라이더에 최초 1회만 반영
 
         function setText(id, value) {
             document.getElementById(id).innerText = (value !== undefined && value !== null) ? value : "--";
@@ -104,6 +105,12 @@
                 }
 
                 setText("modeDisplay", data.mode);
+
+                if (!sliderSynced && data.dust_threshold !== undefined) {
+                    document.getElementById("dustSlider").value = data.dust_threshold;
+                    updateSliderText(data.dust_threshold);
+                    sliderSynced = true;
+                }
 
                 // 장애 알림: 서버가 보낸 메시지를 그대로 표시
                 let alertBox = document.getElementById("alertBox");
