@@ -4,6 +4,9 @@ import serial
 import time
 import threading
 import os
+import atexit
+import signal
+import sys
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -16,11 +19,16 @@ CORS(app)
 PORT = '/dev/ttyACM0'      # 윈도우에서 테스트할 땐 'COM3' 등으로 변경
 BAUD_RATE = 9600
 
-SENSOR_INTERVAL = 3.0      # 센서 요청 주기(초). DHT22는 최소 2초 간격 필요
+SENSOR_INTERVAL = 3.0      # 정상일 때 센서 요청 주기(초). DHT22는 최소 2초 간격 필요
+RETRY_INTERVAL = 2.1       # 센서 읽기 실패 시 재시도 간격(초). DHT22 최소 간격 이상으로 유지
 READ_TIMEOUT = 2.0         # GET_SENSOR 응답 대기 한도(초)
-MOVE_SECONDS = 5.0         # 창문이 완전히 열리/닫히는 데 걸리는 시간(실측해서 조정!)
-                           # 아두이노의 MAX_RUN_MS(기본 8000ms)보다 반드시 짧아야 함
 FAIL_LIMIT = 3             # 연속 이 횟수만큼 실패하면 장애 알림
+
+MOVE_SECONDS = 5.0         # 창문이 완전히 열리/닫히는 데 걸리는 시간(실측해서 조정!)
+                           # 아두이노의 MAX_RUN_MS(8000ms)보다 반드시 짧아야 함
+REVERSE_DELAY = 0.3        # 이동 중 반대 방향으로 바꿀 때 정지 후 대기 시간(초) - 모터/드라이버 보호
+MOTOR_RETRIES = 3          # 모터 명령 ACK를 못 받았을 때 재전송 횟수
+
 FAILSAFE_CLOSE_ON_FAULT = True  # 자동 모드에서 '통신 장애' 시 안전을 위해 창문 닫기
 
 # 아두이노가 DHT 읽기 실패 시 TEMP/HUMI 자리에 보내는 값(-999). 이 이하이면 DHT 오류로 판단
@@ -77,8 +85,8 @@ system_data = {
 
 move_end_time = 0.0
 
-# 장애 원인을 종류별로 관리: comm = 통신 장애, dht = 온습도 센서 장애
-fault_reasons = {"comm": None, "dht": None}
+# 장애 원인을 종류별로 관리: comm = 통신 장애, dht = 온습도 센서 장애, motor = 모터 명령 장애
+fault_reasons = {"comm": None, "dht": None, "motor": None}
 comm_fail_count = 0
 dht_fail_count = 0
 
@@ -107,13 +115,51 @@ def read_sensor_line():
 
 
 def send_motor(cmd: bytes):
-    """모터 명령 전송 후 ACK까지 읽어서 버퍼에 남기지 않는다."""
+    """모터 명령 한 번 전송하고 응답 한 줄을 돌려준다."""
     with serial_lock:
         ser.reset_input_buffer()
         ser.write(cmd)
-        ack = ser.readline().decode('utf-8', errors='ignore').strip()
-    print(f">>> 아두이노 응답: {ack}")
-    return ack
+        return ser.readline().decode('utf-8', errors='ignore').strip()
+
+
+def send_motor_checked(cmd: bytes):
+    """모터 명령을 보내고, 기대한 ACK(예: WINDOW_OPEN_SUCCESS)가 올 때까지 재시도.
+    성공하면 True, 끝내 실패하면 장애를 기록하고 False."""
+    expected = cmd.decode().strip() + "_SUCCESS"
+    for attempt in range(1, MOTOR_RETRIES + 1):
+        try:
+            ack = send_motor(cmd)
+        except Exception as e:
+            ack = ""
+            print(f"모터 명령 전송 예외: {e}")
+        if expected in ack:
+            print(f">>> 아두이노 응답: {ack}")
+            if fault_reasons["motor"]:
+                fault_reasons["motor"] = None
+                refresh_fault()
+            return True
+        print(f"모터 명령 응답 이상 ({attempt}/{MOTOR_RETRIES}): '{ack}'")
+        time.sleep(0.1)
+
+    fault_reasons["motor"] = "모터 명령 응답 없음 - 배선/시리얼 연결 확인 필요"
+    refresh_fault()
+    return False
+
+
+def emergency_stop(reason=""):
+    """서버 시작/종료 시 모터를 확실히 멈춘다. (응답은 기다리지 않음)"""
+    if not ser:
+        return
+    got = serial_lock.acquire(timeout=2)  # 다른 스레드가 잡고 있어도 2초 후엔 진행
+    try:
+        ser.write(b"WINDOW_STOP\n")
+        ser.flush()
+        print(f">>> 모터 비상 정지 전송 ({reason})")
+    except Exception as e:
+        print(f"비상 정지 전송 실패: {e}")
+    finally:
+        if got:
+            serial_lock.release()
 
 
 def parse_sensor_line(line):
@@ -138,11 +184,20 @@ def move_window(target):
         if system_data["window_state"] == target:
             return False  # 이미 그 방향 (동작 중이거나 완료) -> 중복 전송 안 함
 
+        stopped_first = False
         if ser:
-            try:
-                send_motor(b"WINDOW_OPEN\n" if target == "OPEN" else b"WINDOW_CLOSE\n")
-            except Exception as e:
-                print(f"모터 명령 전송 실패: {e}")
+            # 이동 중 반대 방향으로 바꿀 땐 먼저 정지하고 잠시 기다린다 (급반전 방지)
+            if system_data["moving"]:
+                send_motor_checked(b"WINDOW_STOP\n")
+                time.sleep(REVERSE_DELAY)
+                stopped_first = True
+
+            cmd = b"WINDOW_OPEN\n" if target == "OPEN" else b"WINDOW_CLOSE\n"
+            if not send_motor_checked(cmd):
+                if stopped_first:
+                    # 멈춘 뒤 새 명령이 실패 -> 위치를 알 수 없으니 다음 판단 때 다시 시도
+                    system_data["window_state"] = "UNKNOWN"
+                    system_data["moving"] = False
                 return False
 
         system_data["window_state"] = target
@@ -153,15 +208,11 @@ def move_window(target):
 
 
 def check_motor_stop():
-    """동작 시간이 지나면 WINDOW_STOP 전송."""
+    """동작 시간이 지나면 WINDOW_STOP 전송. ACK를 못 받으면 다음 루프에서 재시도."""
     with state_lock:
         if system_data["moving"] and time.time() >= move_end_time:
-            if ser:
-                try:
-                    send_motor(b"WINDOW_STOP\n")
-                except Exception as e:
-                    print(f"정지 명령 전송 실패: {e}")
-                    return  # 다음 루프에서 재시도
+            if ser and not send_motor_checked(b"WINDOW_STOP\n"):
+                return  # moving 유지 -> 다음 루프에서 재시도 (아두이노 MAX_RUN_MS가 최후 안전장치)
             system_data["moving"] = False
             print(">>> 모터 정지")
 
@@ -244,14 +295,14 @@ def auto_control():
 
 
 def hardware_control_loop():
-    last_sensor = 0.0
+    next_sensor = 0.0
     while True:
         check_motor_stop()
 
-        now = time.time()
-        if now - last_sensor >= SENSOR_INTERVAL:
-            last_sensor = now
+        if time.time() >= next_sensor:
             ok = update_sensor()
+            # 실패하면 정상 주기를 기다리지 않고 더 빨리 재시도 (일시적 오류 복구)
+            next_sensor = time.time() + (SENSOR_INTERVAL if ok else RETRY_INTERVAL)
             # 최신 데이터가 있거나, 통신 장애가 확정된 경우(페일세이프)에만 자동 제어
             if system_data["mode"] == "AUTO" and (ok or comm_fault()):
                 auto_control()
@@ -301,7 +352,17 @@ def receive_command():
     return jsonify({"status": "success"})
 
 
+def _on_sigterm(signum, frame):
+    # systemd 등이 종료 신호(SIGTERM)를 보내면 정상 종료 -> atexit의 비상 정지가 실행됨
+    sys.exit(0)
+
+
 if __name__ == '__main__':
+    # 시작 시 모터가 돌고 있지 않도록 한 번 정지 명령을 보내고, 종료 시에도 정지
+    emergency_stop("서버 시작")
+    atexit.register(emergency_stop, "서버 종료")
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
     # debug 리로더가 프로세스를 두 번 띄워 스레드/시리얼 포트가 중복되는 것을 방지
     threading.Thread(target=hardware_control_loop, daemon=True).start()
     print("통신 서버 가동 시작... (http://<라즈베리파이IP>:5000 접속)")
