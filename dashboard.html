@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>dashboard</title>
+    <title>스마트 창문 제어</title>
     <style>
         body { font-family: sans-serif; text-align: center; padding: 50px; }
         .card { border: 1px solid #ccc; padding: 20px; border-radius: 10px; margin-bottom: 20px; }
@@ -58,10 +58,11 @@
     </div>
 
     <script>
-        // 라즈베리파이 등 다른 기기에서 접속하려면 'http://라즈베리파이IP:5000'으로 변경
-        const SERVER_URL = "http://127.0.0.1:5000";
+        // 상대경로: Flask가 이 페이지를 제공한 주소로 그대로 요청하므로 어느 기기에서 열어도 동작
+        // (반드시 http://<라즈베리파이IP>:5000 으로 접속할 것. 파일을 더블클릭해서 열면 동작하지 않음)
+        const SERVER_URL = "";
 
-        const STATE_TEXT = { "OPEN": "열림", "CLOSED": "닫힘" };
+        const STATE_TEXT = { "OPEN": "열림", "CLOSED": "닫힘", "UNKNOWN": "알 수 없음" };
 
         function setText(id, value) {
             document.getElementById(id).innerText = (value !== undefined && value !== null) ? value : "--";
