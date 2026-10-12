@@ -1,0 +1,89 @@
+아두이노 코드
+
+#include <DHT.h>
+
+#define DHTPIN 2       // AM2302 (DHT22) Sensor Pin (Digital 2)
+#define DHTTYPE DHT22  // Sensor type
+DHT dht(DHTPIN, DHTTYPE);
+
+// L298 Motor Driver Pins (for window open/close)
+const int ENA = 3;
+const int IN1 = 4;
+const int IN2 = 5;
+
+// Rain Sensor Pin (Digital input from rain sensor relay module)
+const int RAIN_PIN = 7;
+
+// PM2.5 Dust Sensor Pins (GP2Y1023AU0F)
+const int DUST_ANALOG_PIN = A0; // Dust sensor analog output
+const int DUST_LED_PIN = 8;     // Dust sensor internal LED control pin
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+ 
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(RAIN_PIN, INPUT);
+  pinMode(DUST_LED_PIN, OUTPUT);
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim(); // Remove spaces and newline characters
+
+    // 1. Request sensor data (Temp, Humidity, Rain, Dust)
+    if (cmd == "GET_SENSOR") {
+      float h = dht.readHumidity();
+      float t = dht.readTemperature();
+      int rainState = digitalRead(RAIN_PIN); // HIGH or LOW depending on rain
+     
+      // Read PM2.5 Dust Sensor value
+      digitalWrite(DUST_LED_PIN, LOW); // Power on dust sensor LED
+      delayMicroseconds(280);
+      int dustVal = analogRead(DUST_ANALOG_PIN); // Read dust density
+      delayMicroseconds(40);
+      digitalWrite(DUST_LED_PIN, HIGH); // Power off dust sensor LED
+
+      if (isnan(h) || isnan(t)) {
+        Serial.println("ERROR: Sensor Read Failed");
+      } else {
+        // Send comma-separated values for Python parsing
+        Serial.print("TEMP:");
+        Serial.print(t);
+        Serial.print(",HUMI:");
+        Serial.print(h);
+        Serial.print(",RAIN:");
+        Serial.print(rainState);
+        Serial.print(",DUST:");
+        Serial.println(dustVal);
+      }
+    }
+    // 2. Open window (motor forward)
+    else if (cmd == "WINDOW_OPEN") {
+      digitalWrite(IN1, HIGH);
+      digitalWrite(IN2, LOW);
+      analogWrite(ENA, 200); // Speed control (0-255)
+      Serial.println("ACK: WINDOW_OPEN_SUCCESS");
+    }
+    // 3. Close window (motor reverse)
+    else if (cmd == "WINDOW_CLOSE") {
+      digitalWrite(IN1, LOW);
+      digitalWrite(IN2, HIGH);
+      analogWrite(ENA, 200);
+      Serial.println("ACK: WINDOW_CLOSE_SUCCESS");
+    }
+    // 4. Stop motor
+    else if (cmd == "WINDOW_STOP") {
+      digitalWrite(IN1, LOW);
+      digitalWrite(IN2, LOW);
+      analogWrite(ENA, 0);
+      Serial.println("ACK: WINDOW_STOP_SUCCESS");
+    }
+    else {
+      Serial.println("ACK: UNKNOWN_COMMAND");
+    }
+  }
+}
