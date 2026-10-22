@@ -13,6 +13,7 @@
     SW_LOG_DIR       로그 폴더 (기본 ./logs)
     SW_SIMULATE      1이면 아두이노 없이 동작 (개발/화면 확인용)
 """
+import ast
 import atexit
 import json
 import logging
@@ -120,9 +121,10 @@ system_data = {
     "outdoor_temp": 18.2,   # 실외 센서가 없다면 API나 고정값 사용
     "outdoor_hum": 62.0,
     "dust": 0,              # μg/m³ (변환값)
-    "dust_raw": 0,
-    "rain_amount": 0,  # 앱 인벤터 변수명으로 변경 (비가 오면 1, 안 오면 0 등으로 매핑 가능)
-    "window_state": "UNKNOWN",
+    "dust_raw": 0,          # ADC 원시값 (보정용)
+    "rain_detected": False,  # 웹 대시보드/자동 제어용 (True/False)
+    "rain_amount": 0,        # 앱 인벤터용 (비 감지 1 / 맑음 0)
+    "window_state": "UNKNOWN",  # 시작/재연결 직후에는 실제 위치를 모르므로 첫 판단 때 반드시 명령을 보냄
     "moving": False,        # 모터 동작 중 여부
     "fault_alert": 0,
     "fault_message": "",
@@ -379,6 +381,23 @@ def check_motor_stop():
         log.info("모터 정지")
 
 
+def stop_window():
+    """수동 정지 명령. 이동 중에 멈추면 창문이 중간 위치일 수 있으므로 위치를 UNKNOWN으로 둔다
+    (다음 자동 판단 때 끝까지 다시 움직이도록)."""
+    with state_lock:
+        if not SIMULATE:
+            if ser is None:
+                log.warning("아두이노 미연결 - 정지 명령을 보낼 수 없습니다")
+                return False
+            if not send_motor_checked(b"WINDOW_STOP\n"):
+                return False
+        if system_data["moving"]:
+            system_data["window_state"] = "UNKNOWN"
+        system_data["moving"] = False
+        log.info("수동 정지")
+        return True
+
+
 # -----------------------------------------------------------------
 # 4. 센서 갱신 + 자동 제어
 # -----------------------------------------------------------------
@@ -432,6 +451,7 @@ def update_sensor():
     # --- 비/미세먼지는 DHT와 무관하게 항상 갱신 ---
     system_data["dust_raw"] = dust_raw
     system_data["dust"] = raw_to_ugm3(dust_raw)
+    system_data["rain_detected"] = (rain == 0)
     system_data["rain_amount"] = 1 if rain == 0 else 0
 
     # --- 온습도(DHT)는 실패 시 이전 값을 유지하고 연속 실패 시에만 알림 ---
@@ -515,20 +535,47 @@ def health():
     return jsonify(body), (200 if alive else 503)
 
 
+def parse_body():
+    """요청 본문을 dict로 해석한다.
+    앱 인벤터(Web.PostText)는 Content-Type을 application/json으로 보내지 않는 경우가 있고,
+    텍스트 블록에 작은따옴표({'cmd': 'OPEN'})를 쓰는 경우도 있어서 둘 다 허용한다."""
+    raw = request.get_data(as_text=True) or ""
+    if len(raw) > 1000:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        try:
+            data = ast.literal_eval(raw.strip())  # 리터럴만 해석하므로 코드가 실행되지 않는다
+        except (ValueError, SyntaxError):
+            return None
+    return data if isinstance(data, dict) else None
+
+
 @app.route('/command', methods=['POST'])
 def receive_command():
-    data = request.get_json(silent=True) or {}
-    log.info("웹에서 수신된 명령: %s", data)
+    data = parse_body()
+    if data is None:
+        log.warning("해석할 수 없는 요청 본문: %r", request.get_data(as_text=True)[:200])
+        return jsonify({"status": "error", "message": "요청 본문을 해석할 수 없습니다 (예: {\"cmd\": \"OPEN\"})"}), 400
+    log.info("수신된 명령: %s", data)
 
     if "cmd" in data:
         cmd = data["cmd"]
         if cmd == "AUTO":
             system_data["mode"] = "AUTO"
             log.info("자동 모드로 전환")
+        elif cmd == "MANUAL":
+            system_data["mode"] = "MANUAL"
+            log.info("수동 모드로 전환")
         elif cmd in ("OPEN", "CLOSE"):
             system_data["mode"] = "MANUAL"
             move_window("OPEN" if cmd == "OPEN" else "CLOSED")
             log.info("수동 개입: 창문 %s", cmd)
+        elif cmd == "STOP":
+            system_data["mode"] = "MANUAL"
+            if not stop_window():
+                return jsonify({"status": "error", "message": "정지 명령 전달 실패"}), 503
         else:
             return jsonify({"status": "error", "message": "알 수 없는 명령"}), 400
 
@@ -587,28 +634,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-@app.route('/command', methods=['POST'])
-def receive_command():
-    data = request.get_json(silent=True) or {}
-    log.info("웹에서 수신된 명령: %s", data)
-
-    if "cmd" in data:
-        cmd = data["cmd"]
-        if cmd == "AUTO":
-            system_data["mode"] = "AUTO"
-            log.info("자동 모드로 전환")
-        elif cmd == "MANUAL":
-            system_data["mode"] = "MANUAL"
-            log.info("수동 모드로 전환")
-        elif cmd in ("OPEN", "CLOSE"):
-            system_data["mode"] = "MANUAL"
-            move_window("OPEN" if cmd == "OPEN" else "CLOSED")
-            log.info("수동 개입: 창문 %s", cmd)
-        elif cmd == "STOP":
-            system_data["mode"] = "MANUAL"
-            # 모터 정지 명령 전송 로직
-            send_motor_checked(b"WINDOW_STOP\n")
-            log.info("수동 개입: 창문 정지")
-        else:
-            return jsonify({"status": "error", "message": "알 수 없는 명령"}), 400
