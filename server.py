@@ -120,9 +120,9 @@ system_data = {
     "outdoor_temp": 18.2,   # 실외 센서가 없다면 API나 고정값 사용
     "outdoor_hum": 62.0,
     "dust": 0,              # μg/m³ (변환값)
-    "dust_raw": 0,          # ADC 원시값 (보정용)
-    "rain_detected": False,
-    "window_state": "UNKNOWN",  # 시작/재연결 직후에는 실제 위치를 모르므로 첫 판단 때 반드시 명령을 보냄
+    "dust_raw": 0,
+    "rain_amount": 0,  # 앱 인벤터 변수명으로 변경 (비가 오면 1, 안 오면 0 등으로 매핑 가능)
+    "window_state": "UNKNOWN",
     "moving": False,        # 모터 동작 중 여부
     "fault_alert": 0,
     "fault_message": "",
@@ -432,7 +432,7 @@ def update_sensor():
     # --- 비/미세먼지는 DHT와 무관하게 항상 갱신 ---
     system_data["dust_raw"] = dust_raw
     system_data["dust"] = raw_to_ugm3(dust_raw)
-    system_data["rain_detected"] = (rain == 0)
+    system_data["rain_amount"] = 1 if rain == 0 else 0
 
     # --- 온습도(DHT)는 실패 시 이전 값을 유지하고 연속 실패 시에만 알림 ---
     if temp <= DHT_ERROR_THRESHOLD or humi <= DHT_ERROR_THRESHOLD:
@@ -587,3 +587,28 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+@app.route('/command', methods=['POST'])
+def receive_command():
+    data = request.get_json(silent=True) or {}
+    log.info("웹에서 수신된 명령: %s", data)
+
+    if "cmd" in data:
+        cmd = data["cmd"]
+        if cmd == "AUTO":
+            system_data["mode"] = "AUTO"
+            log.info("자동 모드로 전환")
+        elif cmd == "MANUAL":
+            system_data["mode"] = "MANUAL"
+            log.info("수동 모드로 전환")
+        elif cmd in ("OPEN", "CLOSE"):
+            system_data["mode"] = "MANUAL"
+            move_window("OPEN" if cmd == "OPEN" else "CLOSED")
+            log.info("수동 개입: 창문 %s", cmd)
+        elif cmd == "STOP":
+            system_data["mode"] = "MANUAL"
+            # 모터 정지 명령 전송 로직
+            send_motor_checked(b"WINDOW_STOP\n")
+            log.info("수동 개입: 창문 정지")
+        else:
+            return jsonify({"status": "error", "message": "알 수 없는 명령"}), 400
