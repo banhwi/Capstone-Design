@@ -14,8 +14,8 @@ WorkingDirectory=/home/pi/smart_window
 ExecStart=/usr/bin/python3 /home/pi/smart_window/server.py
 # 아두이노가 인식되는 포트. 포트 번호가 바뀌는 문제를 피하려면 /dev/serial/by-id/ 아래 경로 사용 권장
 Environment=SW_SERIAL_PORT=/dev/ttyACM0
-# 창문이 끝까지 열리/닫히는 실측 시간(초). 아두이노 MAX_RUN_MS(8초)보다 짧아야 함
-Environment=SW_MOVE_SECONDS=5
+# 창문이 끝까지 열리/닫히는 실측 시간(초). 아두이노 MAX_RUN_MS(25초)보다 5초 이상 짧아야 함
+Environment=SW_MOVE_SECONDS=18
 Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=5

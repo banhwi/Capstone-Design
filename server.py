@@ -9,7 +9,7 @@
     SW_SERIAL_PORT   시리얼 포트 (기본 /dev/ttyACM0, 윈도우는 COM3 등)
     SW_HTTP_HOST     바인드 주소 (기본 0.0.0.0)
     SW_HTTP_PORT     웹 포트 (기본 5000)
-    SW_MOVE_SECONDS  창문이 끝까지 열리/닫히는 시간(초, 기본 5) - 반드시 실측해서 설정
+    SW_MOVE_SECONDS  창문이 끝까지 열리/닫히는 시간(초, 기본 18) - 반드시 실측해서 설정
     SW_LOG_DIR       로그 폴더 (기본 ./logs)
     SW_SIMULATE      1이면 아두이노 없이 동작 (개발/화면 확인용)
 """
@@ -54,7 +54,7 @@ READ_TIMEOUT = 2.0           # GET_SENSOR 응답 대기 한도(초)
 FAIL_LIMIT = 3               # 연속 이 횟수만큼 실패하면 장애 알림
 RECONNECT_INTERVAL = 5.0     # 시리얼 재연결 시도 최소 간격(초)
 
-MOVE_SECONDS = _env_float("SW_MOVE_SECONDS", 5.0)  # 아두이노 MAX_RUN_MS(8000ms)보다 반드시 짧아야 함
+MOVE_SECONDS = _env_float("SW_MOVE_SECONDS", 18.0)  # 끝까지 나오는 시간(실측). 아두이노 MAX_RUN_MS(25000ms)보다 5초 이상 짧아야 함
 REVERSE_DELAY = 0.3          # 이동 중 반대 방향으로 바꿀 때 정지 후 대기 시간(초)
 MOTOR_RETRIES = 3            # 모터 명령 ACK를 못 받았을 때 재전송 횟수
 SHUTDOWN_JOIN_TIMEOUT = 5.0  # 종료 시 제어 스레드가 끝나기를 기다리는 최대 시간(초)
