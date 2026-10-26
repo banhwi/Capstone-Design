@@ -27,7 +27,11 @@
             🏠 <strong>[실내]</strong> 온도: <span id="inTempDisplay">--</span> °C | 습도: <span id="inHumDisplay">--</span> %
         </div>
         <div class="sensor-row">
-            ☁️ <strong>[실외]</strong> 온도: <span id="outTempDisplay">--</span> °C | 습도: <span id="outHumDisplay">--</span> %
+            ☁️ <strong>[실외·기상청]</strong> 온도: <span id="outTempDisplay">--</span> °C | 습도: <span id="outHumDisplay">--</span> %
+        </div>
+        <div class="sensor-row">
+            🌦️ 기상청 강수: <span id="pcpDisplay">--</span> | 1시간 강수량 <span id="rnDisplay">--</span> mm
+            <span class="raw">(<span id="wxTimeDisplay">--</span>)</span>
         </div>
         <div class="sensor-row">
             🌬️ 미세먼지: <span id="dustDisplay">--</span> μg/m³
@@ -79,6 +83,10 @@
                 setText("inHumDisplay", data.indoor_hum);
                 setText("outTempDisplay", data.outdoor_temp);
                 setText("outHumDisplay", data.outdoor_hum);
+                setText("pcpDisplay", data.outdoor_pty_text);
+                setText("rnDisplay", data.outdoor_rain_mm);
+                // 갱신 실패 시에는 기준 시각 대신 원인을 보여준다
+                setText("wxTimeDisplay", data.weather_ok ? (data.weather_updated + " 기준") : (data.weather_message || "--"));
                 setText("dustDisplay", data.dust);
                 setText("dustRawDisplay", data.dust_raw);
 
