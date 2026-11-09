@@ -767,9 +767,19 @@ def home():
     return send_from_directory(BASE_DIR, 'dashboard.html')
 
 
+# 소수점이 있는 센서값은 문자열("20.5")로 내보낸다.
+# 앱 인벤터 앱에서 소수 값(20.5 등)만 라벨에 표시되지 않고 정수/문자열은 정상 표시되는 현상을 피하기 위함이다.
+# (문자열이어도 앱의 라벨 표시와 웹 대시보드 표시에는 차이가 없다)
+TEXT_STATUS_FIELDS = ("indoor_temp", "indoor_hum", "outdoor_temp", "outdoor_hum", "outdoor_rain_mm")
+
+
 @app.route('/status', methods=['GET'])
 def get_status():
-    return jsonify(system_data)
+    data = dict(system_data)
+    for k in TEXT_STATUS_FIELDS:
+        if isinstance(data.get(k), float):
+            data[k] = f"{data[k]:.1f}"
+    return jsonify(data)
 
 
 @app.route('/health', methods=['GET'])
