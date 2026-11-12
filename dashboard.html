@@ -9,37 +9,41 @@
         .sensor-row { margin: 10px 0; font-size: 18px; }
         button { padding: 10px 20px; margin: 5px; cursor: pointer; font-size: 16px; }
         #alertBox { display: none; color: white; background-color: red; padding: 10px; font-weight: bold; margin-bottom: 20px; }
+        .rain-warning { color: blue; font-weight: bold; }
         .moving { color: orange; font-weight: bold; }
         .raw { font-size: 13px; color: gray; }
         .chip { display: inline-block; padding: 2px 10px; border-radius: 12px; color: white; font-size: 15px; font-weight: bold; background: #999; }
         .dot { display: inline-block; width: 16px; height: 16px; border-radius: 50%; vertical-align: middle; border: 1px solid #888; background: #ddd; }
+        .wx { font-size: 22px; }
         input[type=range] { width: 60%; margin: 15px 0; }
     </style>
 </head>
 <body>
     <h2>스마트 홈 대시보드</h2>
 
-    <!-- 장애 알림창 -->
-    <div id="alertBox">장애 발생</div>
+    <!-- 장애 알림창: 서버가 보내는 fault_message를 표시 -->
+    <div id="alertBox">⚠️ 장애 발생</div>
 
     <div class="card">
         <h3>실내외 온습도 및 환경 수치</h3>
         <div class="sensor-row">
-            [실내] 온도: <span id="inTempDisplay">--</span> °C | 습도: <span id="inHumDisplay">--</span> %
+            🏠 <strong>[실내]</strong> 온도: <span id="inTempDisplay">--</span> °C | 습도: <span id="inHumDisplay">--</span> %
         </div>
         <div class="sensor-row">
-            [실외·기상청] 온도: <span id="outTempDisplay">--</span> °C | 습도: <span id="outHumDisplay">--</span> %
+            ☁️ <strong>[실외·기상청]</strong> 온도: <span id="outTempDisplay">--</span> °C | 습도: <span id="outHumDisplay">--</span> %
         </div>
         <div class="sensor-row">
-            미세먼지: <span id="dustDisplay">--</span> μg/m³
+            <span class="wx" id="wxIcon">🌡️</span> <strong>날씨(기상청)</strong>: <strong id="wxText">--</strong>
+            <span class="raw">(강수 <span id="pcpDisplay">--</span> · 1시간 강수량 <span id="rnDisplay">--</span> mm · <span id="wxTimeDisplay">--</span>)</span>
+        </div>
+        <div class="sensor-row raw" id="wxWarn" style="display:none; color:#b45309;"></div>
+        <div class="sensor-row">
+            🌬️ 미세먼지: <span id="dustDisplay">--</span> μg/m³
             <span id="dustLevel" class="chip">--</span> <span id="ledDot" class="dot" title="LED 색"></span>
             <span class="raw">(원시값 <span id="dustRawDisplay">--</span>)</span>
         </div>
         <div class="sensor-row">
-            날씨: <strong id="skyText">--</strong>
-        </div>
-        <div class="sensor-row">
-            강수: <strong id="ptyText">--</strong>
+            🌧️ 강우 상태(기상청 기준): <span id="rainDisplay">--</span>
         </div>
         <br>
         <p>현재 창문 상태: <strong id="stateDisplay" style="font-size: 20px;">알 수 없음</strong>
@@ -63,11 +67,19 @@
     </div>
 
     <script>
+        // 상대경로: Flask가 이 페이지를 제공한 주소로 그대로 요청하므로 어느 기기에서 열어도 동작
+        // (반드시 http://<라즈베리파이IP>:5000 으로 접속할 것. 파일을 더블클릭해서 열면 동작하지 않음)
         const SERVER_URL = "";
 
         const STATE_TEXT = { "OPEN": "열림", "CLOSED": "닫힘", "UNKNOWN": "알 수 없음" };
-        let sliderSynced = false; 
+        let sliderSynced = false; // 서버에 저장된 임계치를 슬라이더에 최초 1회만 반영
 
+        // 날씨 문구 -> 아이콘
+        const WX_ICON = {
+            "맑음": "☀️", "구름많음": "⛅", "흐림": "☁️", "비": "🌧️", "비/눈": "🌨️", "눈": "❄️",
+            "빗방울": "🌦️", "빗방울눈날림": "🌨️", "눈날림": "❄️", "강수": "🌧️", "강수 없음": "🌤️"
+        };
+        // 미세먼지 LED 색 -> 화면 색
         const LED_CSS = { "blue": "#2563eb", "green": "#16a34a", "orange": "#f59e0b", "red": "#dc2626", "off": "#dddddd" };
 
         function setText(id, value) {
@@ -84,34 +96,47 @@
                 setText("inHumDisplay", data.indoor_hum);
                 setText("outTempDisplay", data.outdoor_temp);
                 setText("outHumDisplay", data.outdoor_hum);
+                setText("pcpDisplay", data.outdoor_pty_text);
+                setText("rnDisplay", data.outdoor_rain_mm);
+                // 갱신 실패 시에는 기준 시각 대신 원인을 보여준다
+                setText("wxTimeDisplay", data.weather_ok ? (data.weather_updated + " 기준") : "갱신 실패");
                 setText("dustDisplay", data.dust);
                 setText("dustRawDisplay", data.dust_raw);
 
-                // 1. 날씨 (맑음, 흐림 등 기상청 sky_text 데이터 직접 연결)
-                setText("skyText", data.sky_text);
+                // 기상청 날씨 (맑음/구름많음/흐림/비/눈 ...)
+                setText("wxText", data.weather_text);
+                // 날씨 정보에 문제가 있으면(예: 하늘 상태를 못 받아 '강수 없음'으로만 표시) 이유를 그대로 보여 준다
+                let wxWarn = document.getElementById("wxWarn");
+                wxWarn.innerText = data.weather_message ? ("⚠️ " + data.weather_message) : "";
+                wxWarn.style.display = data.weather_message ? "block" : "none";
+                document.getElementById("wxIcon").innerText = WX_ICON[data.weather_text] || "🌡️";
 
-                // 2. 강수 (없음 -> '강수 없음'으로 변경하여 표시, 비/눈은 그대로 표시)
-                let pty = data.outdoor_pty_text;
-                if (pty === "없음") {
-                    setText("ptyText", "강수 없음");
-                } else if (pty !== "--") {
-                    setText("ptyText", pty);
-                } else {
-                    setText("ptyText", "--");
-                }
-
-                // 미세먼지 단계 + LED 색
+                // 미세먼지 단계 + LED 색 (서버가 아두이노 LED에 지시하는 색과 같다)
                 let lvl = document.getElementById("dustLevel");
                 lvl.innerText = data.dust_level || "--";
                 lvl.style.background = LED_CSS[data.led_color] || "#999";
                 document.getElementById("ledDot").style.background = LED_CSS[data.led_color] || "#ddd";
 
+                // 강우 상태는 비 센서가 아니라 기상청 기준이다
+                let rainSpan = document.getElementById("rainDisplay");
+                if (data.rain_known !== true) {
+                    rainSpan.innerText = "확인 불가 (기상청 정보 없음 → 자동 모드에서는 창문을 닫아 둠)";
+                    rainSpan.className = "rain-warning";
+                } else if (data.rain_detected === true) {
+                    rainSpan.innerText = "비 감지됨 🌧️";
+                    rainSpan.className = "rain-warning";
+                } else {
+                    rainSpan.innerText = "강수 없음";
+                    rainSpan.className = "";
+                }
+
                 document.getElementById("stateDisplay").innerText =
                     STATE_TEXT[data.window_state] || data.window_state || "알 수 없음";
 
+                // 모터 동작 중 표시
                 let movingSpan = document.getElementById("movingDisplay");
                 if (data.moving) {
-                    movingSpan.innerText = " [이동 중...]";
+                    movingSpan.innerText = " ⚙️ 이동 중...";
                     movingSpan.className = "moving";
                 } else {
                     movingSpan.innerText = "";
@@ -123,4 +148,60 @@
                 if (!sliderSynced && data.dust_threshold !== undefined) {
                     document.getElementById("dustSlider").value = data.dust_threshold;
                     updateSliderText(data.dust_threshold);
-                    slider
+                    sliderSynced = true;
+                }
+
+                // 장애 알림: 서버가 보낸 메시지를 그대로 표시
+                let alertBox = document.getElementById("alertBox");
+                if (data.fault_alert === 1) {
+                    alertBox.innerText = "⚠️ " + (data.fault_message || "장애 발생");
+                    alertBox.style.display = "block";
+                } else {
+                    alertBox.style.display = "none";
+                }
+            } catch (error) {
+                console.error("서버 연결 실패:", error);
+                let alertBox = document.getElementById("alertBox");
+                alertBox.innerText = "⚠️ 서버와 통신할 수 없습니다";
+                alertBox.style.display = "block";
+            }
+        }
+
+        async function sendCommand(cmd) {
+            try {
+                let response = await fetch(SERVER_URL + "/command", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ "cmd": cmd })
+                });
+                if (!response.ok) throw new Error("명령 거부됨");
+                fetchDashboard();
+            } catch (error) {
+                alert("서버 통신 에러! 파이썬 서버가 켜져 있는지 확인하세요.");
+            }
+        }
+
+        function updateSliderText(val) {
+            document.getElementById("thresholdView").innerText = val;
+        }
+
+        async function sendThreshold() {
+            let targetValue = document.getElementById("dustSlider").value;
+            try {
+                let response = await fetch(SERVER_URL + "/command", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ "set_dust": parseInt(targetValue) })
+                });
+                if (!response.ok) throw new Error("설정 거부됨");
+                alert("임계치 " + targetValue + " μg/m³ 설정 완료!");
+            } catch (error) {
+                alert("서버 통신 에러! 파이썬 서버가 켜져 있는지 확인하세요.");
+            }
+        }
+
+        setInterval(fetchDashboard, 1000);
+        fetchDashboard();
+    </script>
+</body>
+</html>

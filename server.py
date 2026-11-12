@@ -40,7 +40,7 @@ import serial
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 어떤 버전의 코드가 실제로 실행 중인지 확인하는 용도 (시작 로그, /health, /status 에 표시)
-SERVER_VERSION = "2026-11-10-kma-rain-led"
+SERVER_VERSION = "2026-11-12-weather-diag"
 
 
 # -----------------------------------------------------------------
@@ -67,7 +67,7 @@ READ_TIMEOUT = 2.0           # GET_SENSOR 응답 대기 한도(초)
 FAIL_LIMIT = 3               # 연속 이 횟수만큼 실패하면 장애 알림
 RECONNECT_INTERVAL = 5.0     # 시리얼 재연결 시도 최소 간격(초)
 
-MOVE_SECONDS = _env_float("SW_MOVE_SECONDS", 40.0)  # 끝까지 나오는 시간(실측, 기존 18초의 3배). 아두이노 MAX_RUN_MS(75000ms)보다 5초 이상 짧아야 함
+MOVE_SECONDS = _env_float("SW_MOVE_SECONDS", 54.0)  # 끝까지 나오는 시간(실측, 기존 18초의 3배). 아두이노 MAX_RUN_MS(75000ms)보다 5초 이상 짧아야 함
 REVERSE_DELAY = 0.3          # 이동 중 반대 방향으로 바꿀 때 정지 후 대기 시간(초)
 MOTOR_RETRIES = 3            # 모터 명령 ACK를 못 받았을 때 재전송 횟수
 SHUTDOWN_JOIN_TIMEOUT = 5.0  # 종료 시 제어 스레드가 끝나기를 기다리는 최대 시간(초)
@@ -159,6 +159,7 @@ system_data = {
     "weather_updated": "--",    # 기상청 관측 기준 시각
     "weather_text": "--",       # 표시용 날씨 문구 (맑음/구름많음/흐림/비/눈 ...)
     "sky_text": "--",           # 기상청 초단기예보 하늘 상태 (맑음/구름많음/흐림)
+    "sky_ok": False,            # 하늘 상태(초단기예보)를 실제로 받았는지. False면 weather_text 가 "강수 없음"으로만 표시된다
     "weather_ok": False,
     "weather_message": "기상청 데이터를 아직 가져오지 못했습니다",
     "dust": 0,              # μg/m³ (변환값)
@@ -176,6 +177,7 @@ system_data = {
     "dust_threshold": 35,
 }
 
+weather_debug = {}   # /weather 에서 보여 주는 마지막 기상청 조회 정보(인증키 제외)
 move_end_time = 0.0
 last_sensor_ok = 0.0
 last_reconnect = 0.0
@@ -850,12 +852,16 @@ def fetch_weather_bundle(key):
     else:
         raise RuntimeError("인증 실패 - 인증키와 API 신청/승인 상태를 확인하세요. " + " / ".join(errors))
 
-    fcst, fcst_error = None, None
+    fcst, fcst_error, fcst_base = None, None, None
     try:
-        fcst, _ = fetch_forecast_now(key, KMA_SOURCE)
+        fcst, fcst_base = fetch_forecast_now(key, KMA_SOURCE)
+    except KmaAuthError as e:
+        # 실황은 되는데 예보만 거부되는 경우: 이 API(초단기예보)가 신청/승인되지 않은 경우가 많다
+        fcst_error = _scrub(f"권한 오류 - 인증키로 '초단기예보' API를 쓸 수 있는지(신청/승인) 확인하세요 ({e})", key)
     except Exception as e:  # 하늘 상태는 부가 정보이므로 실패해도 실황은 그대로 사용한다
         fcst_error = _scrub(str(e), key)
-    return {"obs": obs, "obs_base": base, "fcst": fcst, "fcst_error": fcst_error}
+    return {"obs": obs, "obs_base": base, "fcst": fcst, "fcst_error": fcst_error,
+            "fcst_base": fcst_base, "source": KMA_SOURCE}
 
 
 def apply_weather(b):
@@ -886,6 +892,7 @@ def apply_weather(b):
     sky = _num(fcst.get("SKY")) if fcst else None
     sky_text = SKY_TEXT.get(int(sky), "--") if sky is not None else "--"
     system_data["sky_text"] = sky_text
+    system_data["sky_ok"] = sky_text != "--"
     if precip:
         system_data["weather_text"] = PTY_TEXT.get(pty_code, "강수") if pty_code else "강수"
     elif sky_text != "--":
@@ -896,7 +903,26 @@ def apply_weather(b):
     last_weather_ok = time.time()
     system_data["weather_updated"] = b["obs_base"].strftime("%Y-%m-%d %H:%M")
     system_data["weather_ok"] = True
-    system_data["weather_message"] = f"하늘 상태 조회 실패: {b['fcst_error']}" if b["fcst_error"] else ""
+    if b["fcst_error"]:
+        system_data["weather_message"] = f"하늘 상태(맑음/흐림)를 가져오지 못했습니다: {b['fcst_error']}"
+        log.warning("하늘 상태(초단기예보) 조회 실패 - 날씨 문구가 '강수 없음'으로 표시됩니다: %s", b["fcst_error"])
+    elif sky_text == "--":
+        system_data["weather_message"] = "하늘 상태(SKY) 값이 응답에 없습니다"
+        log.warning("초단기예보 응답에 SKY 값이 없습니다 (받은 항목: %s)", sorted((fcst or {}).keys()))
+    else:
+        system_data["weather_message"] = ""
+    weather_debug.clear()
+    weather_debug.update({
+        "source": b.get("source", KMA_SOURCE),
+        "obs_base": b["obs_base"].strftime("%Y-%m-%d %H:%M"),
+        "obs": {k: obs.get(k) for k in ("T1H", "REH", "RN1", "PTY")},
+        "fcst_base": b["fcst_base"].strftime("%Y-%m-%d %H:%M") if b.get("fcst_base") else None,
+        "fcst_first_slot": {k: fcst.get(k) for k in ("SKY", "PTY", "RN1", "T1H")} if fcst else None,
+        "fcst_error": b["fcst_error"],
+        "weather_text": system_data["weather_text"],
+        "sky_ok": system_data["sky_ok"],
+        "updated_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+    })
     log.info("기상청 갱신: 기온 %s℃ 습도 %s%% 날씨 %s (강수 %s, 하늘 %s) (%s 기준)", t, h,
              system_data["weather_text"], system_data["outdoor_pty_text"], sky_text, system_data["weather_updated"])
 
@@ -952,6 +978,17 @@ def get_status():
         if isinstance(data.get(k), float):
             data[k] = f"{data[k]:.1f}"
     return jsonify(data)
+
+
+@app.route('/weather', methods=['GET'])
+def weather_info():
+    """날씨 표시가 이상할 때 확인용: 기상청에서 마지막으로 받은 값과 하늘 상태 조회 오류(인증키는 포함되지 않음)."""
+    return jsonify({
+        "weather_text": system_data["weather_text"], "sky_text": system_data["sky_text"],
+        "sky_ok": system_data["sky_ok"], "weather_ok": system_data["weather_ok"],
+        "weather_message": system_data["weather_message"], "rain_known": system_data["rain_known"],
+        "kma_source": KMA_SOURCE, "last": weather_debug,
+    })
 
 
 @app.route('/health', methods=['GET'])
