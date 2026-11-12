@@ -36,7 +36,10 @@
             <span class="raw">(원시값 <span id="dustRawDisplay">--</span>)</span>
         </div>
         <div class="sensor-row">
-            날씨: <strong id="wxText">--</strong>
+            날씨: <strong id="skyText">--</strong>
+        </div>
+        <div class="sensor-row">
+            강수: <strong id="ptyText">--</strong>
         </div>
         <br>
         <p>현재 창문 상태: <strong id="stateDisplay" style="font-size: 20px;">알 수 없음</strong>
@@ -84,8 +87,18 @@
                 setText("dustDisplay", data.dust);
                 setText("dustRawDisplay", data.dust_raw);
 
-                // 날씨 문구 표시 (맑음, 흐림, 비 등 서버에서 받아온 텍스트)
-                setText("wxText", data.weather_text);
+                // 1. 날씨 (맑음, 흐림 등 기상청 sky_text 데이터 직접 연결)
+                setText("skyText", data.sky_text);
+
+                // 2. 강수 (없음 -> '강수 없음'으로 변경하여 표시, 비/눈은 그대로 표시)
+                let pty = data.outdoor_pty_text;
+                if (pty === "없음") {
+                    setText("ptyText", "강수 없음");
+                } else if (pty !== "--") {
+                    setText("ptyText", pty);
+                } else {
+                    setText("ptyText", "--");
+                }
 
                 // 미세먼지 단계 + LED 색
                 let lvl = document.getElementById("dustLevel");
@@ -110,59 +123,4 @@
                 if (!sliderSynced && data.dust_threshold !== undefined) {
                     document.getElementById("dustSlider").value = data.dust_threshold;
                     updateSliderText(data.dust_threshold);
-                    sliderSynced = true;
-                }
-
-                let alertBox = document.getElementById("alertBox");
-                if (data.fault_alert === 1) {
-                    alertBox.innerText = "[장애 발생] " + (data.fault_message || "");
-                    alertBox.style.display = "block";
-                } else {
-                    alertBox.style.display = "none";
-                }
-            } catch (error) {
-                console.error("서버 연결 실패:", error);
-                let alertBox = document.getElementById("alertBox");
-                alertBox.innerText = "[통신 오류] 서버와 통신할 수 없습니다";
-                alertBox.style.display = "block";
-            }
-        }
-
-        async function sendCommand(cmd) {
-            try {
-                let response = await fetch(SERVER_URL + "/command", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ "cmd": cmd })
-                });
-                if (!response.ok) throw new Error("명령 거부됨");
-                fetchDashboard();
-            } catch (error) {
-                alert("서버 통신 에러! 파이썬 서버가 켜져 있는지 확인하세요.");
-            }
-        }
-
-        function updateSliderText(val) {
-            document.getElementById("thresholdView").innerText = val;
-        }
-
-        async function sendThreshold() {
-            let targetValue = document.getElementById("dustSlider").value;
-            try {
-                let response = await fetch(SERVER_URL + "/command", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ "set_dust": parseInt(targetValue) })
-                });
-                if (!response.ok) throw new Error("설정 거부됨");
-                alert("임계치 " + targetValue + " μg/m³ 설정 완료!");
-            } catch (error) {
-                alert("서버 통신 에러! 파이썬 서버가 켜져 있는지 확인하세요.");
-            }
-        }
-
-        setInterval(fetchDashboard, 1000);
-        fetchDashboard();
-    </script>
-</body>
-</html>
+                    slider
