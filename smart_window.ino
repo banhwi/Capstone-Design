@@ -9,12 +9,17 @@ const int ENA = 3;
 const int IN1 = 4;
 const int IN2 = 5;
 
-// Rain Sensor Pin (Digital input from rain sensor relay module)
-const int RAIN_PIN = 7;
-
 // PM2.5 Dust Sensor Pins (GP2Y1023AU0F)
 const int DUST_ANALOG_PIN = A0; // Dust sensor analog output
 const int DUST_LED_PIN = 8;     // Dust sensor internal LED control pin
+const int DUST_SAMPLES = 5;     // 미세먼지는 여러 번 측정해 평균을 보낸다 (잡음 감소)
+
+// 미세먼지 단계 표시용 RGB LED (PWM 가능 핀 + 각 색마다 220Ω 저항)
+// 서버(라즈베리파이)가 미세먼지 수치에 따라 LED_BLUE / LED_GREEN / LED_ORANGE / LED_RED 명령을 보낸다.
+const int LED_R_PIN = 9;
+const int LED_G_PIN = 10;
+const int LED_B_PIN = 11;
+const bool LED_COMMON_ANODE = false;  // 공통 애노드 RGB LED라면 true (공통 캐소드는 false)
 
 // ---------------- 센서 오류 처리 ----------------
 // DHT 읽기 실패/범위 이탈 시 TEMP/HUMI 자리에 보내는 값 (서버의 DHT_ERROR_THRESHOLD와 대응)
@@ -29,9 +34,9 @@ float validOrError(float v, float lo, float hi) {
 // ---------------- 모터 안전장치 ----------------
 const int MOTOR_SPEED = 200;                    // 0~255
 // 서버/라즈베리가 멈춰도 이 시간이 지나면 아두이노가 스스로 모터를 끈다.
-// 서버의 MOVE_SECONDS(기본 18초)보다 최소 5초 이상 길게 설정할 것.
+// 서버의 MOVE_SECONDS(기본 54초)보다 최소 5초 이상 길게 설정할 것.
 // (서버의 정지 명령이 재시도/재연결로 몇 초 늦어져도 이 상한이 먼저 걸리지 않도록)
-const unsigned long MAX_RUN_MS = 25000;
+const unsigned long MAX_RUN_MS = 75000;
 // 이동 중 반대 방향 명령이 오면 먼저 멈추고 이 시간만큼 기다린 뒤 반전 (모터/L298 보호)
 const unsigned long REVERSE_DELAY_MS = 300;
 
@@ -82,6 +87,39 @@ void handleMove(int dir, const char* name) {
   }
 }
 
+// ---------------- 미세먼지 LED ----------------
+void writeLedPin(int pin, int value) {
+  analogWrite(pin, LED_COMMON_ANODE ? 255 - value : value);
+}
+
+void setLed(int r, int g, int b) {
+  writeLedPin(LED_R_PIN, r);
+  writeLedPin(LED_G_PIN, g);
+  writeLedPin(LED_B_PIN, b);
+}
+
+void handleLed(const char* name, int r, int g, int b) {
+  setLed(r, g, b);
+  Serial.print("ACK: ");
+  Serial.print(name);
+  Serial.println("_SUCCESS");
+}
+
+// ---------------- 미세먼지 측정 ----------------
+// 센서 LED를 280µs 켠 시점에 읽는 방식으로 여러 번 측정한 평균(ADC 원시값 0~1023)
+int readDust() {
+  long sum = 0;
+  for (int i = 0; i < DUST_SAMPLES; i++) {
+    digitalWrite(DUST_LED_PIN, LOW);  // Power on dust sensor LED
+    delayMicroseconds(280);
+    sum += analogRead(DUST_ANALOG_PIN);
+    delayMicroseconds(40);
+    digitalWrite(DUST_LED_PIN, HIGH); // Power off dust sensor LED
+    delay(10);                        // 센서 측정 주기(약 10ms)를 맞춘다
+  }
+  return (int)(sum / DUST_SAMPLES);
+}
+
 void setup() {
   Serial.begin(9600);
   dht.begin();
@@ -89,10 +127,13 @@ void setup() {
   pinMode(IN1, OUTPUT);
   pinMode(IN2, OUTPUT);
   pinMode(ENA, OUTPUT);
-  pinMode(RAIN_PIN, INPUT);
   pinMode(DUST_LED_PIN, OUTPUT);
+  pinMode(LED_R_PIN, OUTPUT);
+  pinMode(LED_G_PIN, OUTPUT);
+  pinMode(LED_B_PIN, OUTPUT);
   digitalWrite(DUST_LED_PIN, HIGH);  // 센서 LED는 평소 꺼 둔다
   stopMotor();  // 부팅 직후 모터가 도는 일이 없도록 정지 상태로 시작
+  setLed(0, 0, 0);  // 서버가 미세먼지 단계를 알려 줄 때까지 표시 LED는 꺼 둔다
 }
 
 void loop() {
@@ -107,26 +148,18 @@ void loop() {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim(); // Remove spaces and newline characters
 
-    // 1. Request sensor data (Temp, Humidity, Rain, Dust)
+    // 1. Request sensor data (Temp, Humidity, Dust)
+    //    비 판단은 비 센서가 아니라 기상청 정보로 서버가 한다.
     if (cmd == "GET_SENSOR") {
       float h = validOrError(dht.readHumidity(), 0.0, 100.0);
       float t = validOrError(dht.readTemperature(), -40.0, 80.0);
-      int rainState = digitalRead(RAIN_PIN); // LOW = 비 감지 (릴레이 모듈 기준)
+      int dustVal = readDust();
 
-      // Read PM2.5 Dust Sensor value
-      digitalWrite(DUST_LED_PIN, LOW); // Power on dust sensor LED
-      delayMicroseconds(280);
-      int dustVal = analogRead(DUST_ANALOG_PIN); // Read dust density
-      delayMicroseconds(40);
-      digitalWrite(DUST_LED_PIN, HIGH); // Power off dust sensor LED
-
-      // DHT가 실패해도 비/미세먼지는 계속 보낸다 (실패한 값만 -999로 표시)
+      // DHT가 실패해도 미세먼지는 계속 보낸다 (실패한 값만 -999로 표시)
       Serial.print("TEMP:");
       Serial.print(t);
       Serial.print(",HUMI:");
       Serial.print(h);
-      Serial.print(",RAIN:");
-      Serial.print(rainState);
       Serial.print(",DUST:");
       Serial.println(dustVal);
     }
@@ -144,6 +177,12 @@ void loop() {
       timeoutLockDir = 0;
       Serial.println("ACK: WINDOW_STOP_SUCCESS");
     }
+    // 5. 미세먼지 단계 LED: 0~30 파랑, 31~80 초록, 81~150 주황, 151 이상 빨강
+    else if (cmd == "LED_BLUE")   { handleLed("LED_BLUE",   0,   0, 255); }
+    else if (cmd == "LED_GREEN")  { handleLed("LED_GREEN",  0, 255,   0); }
+    else if (cmd == "LED_ORANGE") { handleLed("LED_ORANGE", 255, 70,  0); }
+    else if (cmd == "LED_RED")    { handleLed("LED_RED",    255,  0,  0); }
+    else if (cmd == "LED_OFF")    { handleLed("LED_OFF",      0,  0,  0); }
     else {
       Serial.println("ACK: UNKNOWN_COMMAND");
     }
