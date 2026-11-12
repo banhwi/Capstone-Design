@@ -67,7 +67,7 @@ READ_TIMEOUT = 2.0           # GET_SENSOR 응답 대기 한도(초)
 FAIL_LIMIT = 3               # 연속 이 횟수만큼 실패하면 장애 알림
 RECONNECT_INTERVAL = 5.0     # 시리얼 재연결 시도 최소 간격(초)
 
-MOVE_SECONDS = _env_float("SW_MOVE_SECONDS", 54.0)  # 끝까지 나오는 시간(실측, 기존 18초의 3배). 아두이노 MAX_RUN_MS(75000ms)보다 5초 이상 짧아야 함
+MOVE_SECONDS = _env_float("SW_MOVE_SECONDS", 40.0)  # 끝까지 나오는 시간(실측, 기존 18초의 3배). 아두이노 MAX_RUN_MS(75000ms)보다 5초 이상 짧아야 함
 REVERSE_DELAY = 0.3          # 이동 중 반대 방향으로 바꿀 때 정지 후 대기 시간(초)
 MOTOR_RETRIES = 3            # 모터 명령 ACK를 못 받았을 때 재전송 횟수
 SHUTDOWN_JOIN_TIMEOUT = 5.0  # 종료 시 제어 스레드가 끝나기를 기다리는 최대 시간(초)

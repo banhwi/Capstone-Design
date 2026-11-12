@@ -32,7 +32,7 @@ float validOrError(float v, float lo, float hi) {
 }
 
 // ---------------- 모터 안전장치 ----------------
-const int MOTOR_SPEED = 200;                    // 0~255
+const int MOTOR_SPEED = 255;                    // 0~255
 // 서버/라즈베리가 멈춰도 이 시간이 지나면 아두이노가 스스로 모터를 끈다.
 // 서버의 MOVE_SECONDS(기본 54초)보다 최소 5초 이상 길게 설정할 것.
 // (서버의 정지 명령이 재시도/재연결로 몇 초 늦어져도 이 상한이 먼저 걸리지 않도록)
