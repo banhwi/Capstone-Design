@@ -12,6 +12,9 @@
         .rain-warning { color: blue; font-weight: bold; }
         .moving { color: orange; font-weight: bold; }
         .raw { font-size: 13px; color: gray; }
+        .chip { display: inline-block; padding: 2px 10px; border-radius: 12px; color: white; font-size: 15px; font-weight: bold; background: #999; }
+        .dot { display: inline-block; width: 16px; height: 16px; border-radius: 50%; vertical-align: middle; border: 1px solid #888; background: #ddd; }
+        .wx { font-size: 22px; }
         input[type=range] { width: 60%; margin: 15px 0; }
     </style>
 </head>
@@ -30,15 +33,16 @@
             ☁️ <strong>[실외·기상청]</strong> 온도: <span id="outTempDisplay">--</span> °C | 습도: <span id="outHumDisplay">--</span> %
         </div>
         <div class="sensor-row">
-            🌦️ 기상청 강수: <span id="pcpDisplay">--</span> | 1시간 강수량 <span id="rnDisplay">--</span> mm
-            <span class="raw">(<span id="wxTimeDisplay">--</span>)</span>
+            <span class="wx" id="wxIcon">🌡️</span> <strong>날씨(기상청)</strong>: <strong id="wxText">--</strong>
+            <span class="raw">(강수 <span id="pcpDisplay">--</span> · 1시간 강수량 <span id="rnDisplay">--</span> mm · <span id="wxTimeDisplay">--</span>)</span>
         </div>
         <div class="sensor-row">
             🌬️ 미세먼지: <span id="dustDisplay">--</span> μg/m³
+            <span id="dustLevel" class="chip">--</span> <span id="ledDot" class="dot" title="LED 색"></span>
             <span class="raw">(원시값 <span id="dustRawDisplay">--</span>)</span>
         </div>
         <div class="sensor-row">
-            🌧️ 강우 상태: <span id="rainDisplay">--</span>
+            🌧️ 강우 상태(기상청 기준): <span id="rainDisplay">--</span>
         </div>
         <br>
         <p>현재 창문 상태: <strong id="stateDisplay" style="font-size: 20px;">알 수 없음</strong>
@@ -69,6 +73,14 @@
         const STATE_TEXT = { "OPEN": "열림", "CLOSED": "닫힘", "UNKNOWN": "알 수 없음" };
         let sliderSynced = false; // 서버에 저장된 임계치를 슬라이더에 최초 1회만 반영
 
+        // 날씨 문구 -> 아이콘
+        const WX_ICON = {
+            "맑음": "☀️", "구름많음": "⛅", "흐림": "☁️", "비": "🌧️", "비/눈": "🌨️", "눈": "❄️",
+            "빗방울": "🌦️", "빗방울눈날림": "🌨️", "눈날림": "❄️", "강수": "🌧️", "강수 없음": "🌤️"
+        };
+        // 미세먼지 LED 색 -> 화면 색
+        const LED_CSS = { "blue": "#2563eb", "green": "#16a34a", "orange": "#f59e0b", "red": "#dc2626", "off": "#dddddd" };
+
         function setText(id, value) {
             document.getElementById(id).innerText = (value !== undefined && value !== null) ? value : "--";
         }
@@ -90,12 +102,26 @@
                 setText("dustDisplay", data.dust);
                 setText("dustRawDisplay", data.dust_raw);
 
+                // 기상청 날씨 (맑음/구름많음/흐림/비/눈 ...)
+                setText("wxText", data.weather_text);
+                document.getElementById("wxIcon").innerText = WX_ICON[data.weather_text] || "🌡️";
+
+                // 미세먼지 단계 + LED 색 (서버가 아두이노 LED에 지시하는 색과 같다)
+                let lvl = document.getElementById("dustLevel");
+                lvl.innerText = data.dust_level || "--";
+                lvl.style.background = LED_CSS[data.led_color] || "#999";
+                document.getElementById("ledDot").style.background = LED_CSS[data.led_color] || "#ddd";
+
+                // 강우 상태는 비 센서가 아니라 기상청 기준이다
                 let rainSpan = document.getElementById("rainDisplay");
-                if (data.rain_detected === true) {
+                if (data.rain_known !== true) {
+                    rainSpan.innerText = "확인 불가 (기상청 정보 없음 → 자동 모드에서는 창문을 닫아 둠)";
+                    rainSpan.className = "rain-warning";
+                } else if (data.rain_detected === true) {
                     rainSpan.innerText = "비 감지됨 🌧️";
                     rainSpan.className = "rain-warning";
                 } else {
-                    rainSpan.innerText = "맑음 ☀️";
+                    rainSpan.innerText = "강수 없음";
                     rainSpan.className = "";
                 }
 

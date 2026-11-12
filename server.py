@@ -3,6 +3,8 @@
 
 - 라즈베리파이에서 이 파일 하나만 실행합니다. (라즈베리파이 단독 제어 스크립트와 동시 실행 금지)
 - 아두이노와 시리얼로 통신하며 센서값 수집 / 자동 개폐 / 수동 제어 / 웹 대시보드를 제공합니다.
+- 비(강수) 판단은 비 센서가 아니라 기상청 실황으로 하고, 하늘 상태(맑음/흐림)는 기상청 초단기예보로 가져옵니다.
+- 미세먼지는 아두이노의 미세먼지 센서로 측정하고, 수치에 따라 LED 색(파랑/초록/주황/빨강)을 아두이노에 지시합니다.
 - 운영 서버(waitress), 로그 파일, 시리얼 자동 재연결, 설정 저장, /health 점검을 포함합니다.
 
 환경변수(선택):
@@ -37,6 +39,8 @@ from flask import Flask, jsonify, request, send_from_directory
 import serial
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 어떤 버전의 코드가 실제로 실행 중인지 확인하는 용도 (시작 로그, /health, /status 에 표시)
+SERVER_VERSION = "2026-11-10-kma-rain-led"
 
 
 # -----------------------------------------------------------------
@@ -63,7 +67,7 @@ READ_TIMEOUT = 2.0           # GET_SENSOR 응답 대기 한도(초)
 FAIL_LIMIT = 3               # 연속 이 횟수만큼 실패하면 장애 알림
 RECONNECT_INTERVAL = 5.0     # 시리얼 재연결 시도 최소 간격(초)
 
-MOVE_SECONDS = _env_float("SW_MOVE_SECONDS", 18.0)  # 끝까지 나오는 시간(실측). 아두이노 MAX_RUN_MS(25000ms)보다 5초 이상 짧아야 함
+MOVE_SECONDS = _env_float("SW_MOVE_SECONDS", 54.0)  # 끝까지 나오는 시간(실측, 기존 18초의 3배). 아두이노 MAX_RUN_MS(75000ms)보다 5초 이상 짧아야 함
 REVERSE_DELAY = 0.3          # 이동 중 반대 방향으로 바꿀 때 정지 후 대기 시간(초)
 MOTOR_RETRIES = 3            # 모터 명령 ACK를 못 받았을 때 재전송 횟수
 SHUTDOWN_JOIN_TIMEOUT = 5.0  # 종료 시 제어 스레드가 끝나기를 기다리는 최대 시간(초)
@@ -73,11 +77,11 @@ FAILSAFE_CLOSE_ON_FAULT = True  # 자동 모드에서 '통신 장애' 시 안전
 DHT_ERROR_THRESHOLD = -990   # 아두이노가 DHT 실패 시 보내는 -999 판별 기준
 DUST_MIN, DUST_MAX = 10, 100  # 대시보드 슬라이더 범위와 동일
 
-# 기상청 초단기실황 (공공데이터포털 '기상청_단기예보 조회서비스')
+# 기상청 동네예보: 초단기실황(getUltraSrtNcst: 기온/습도/강수) + 초단기예보(getUltraSrtFcst: 하늘 상태)
 # 인증키를 발급받은 곳에 따라 주소와 인증 파라미터 이름이 다르다 (서로의 키는 호환되지 않음)
 KMA_ENDPOINTS = {
-    "hub": ("https://apihub.kma.go.kr/api/typ02/openApi/VilageFcstInfoService_2.0/getUltraSrtNcst", "authKey"),
-    "data": ("http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getUltraSrtNcst", "serviceKey"),
+    "hub": ("https://apihub.kma.go.kr/api/typ02/openApi/VilageFcstInfoService_2.0/", "authKey"),
+    "data": ("http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/", "serviceKey"),
 }
 KMA_SOURCE = os.environ.get("SW_KMA_SOURCE", "hub").strip().lower()
 if KMA_SOURCE not in KMA_ENDPOINTS:
@@ -85,6 +89,9 @@ if KMA_SOURCE not in KMA_ENDPOINTS:
 KMA_INTERVAL = 600.0         # 정상 갱신 주기(초). 실황은 매시간 갱신되므로 10분이면 충분
 KMA_RETRY_INTERVAL = 60.0    # 실패 시 재시도 간격(초)
 KMA_TIMEOUT = 10             # 기상청 서버 응답 대기(초)
+KMA_STALE_SECONDS = 5400.0   # 기상청 조회 성공 후 이 시간(90분)이 지나면 강수 정보를 '알 수 없음'으로 본다
+KMA_FAILSAFE_CLOSE = True    # 강수 정보를 알 수 없으면(키 없음/인터넷 끊김 등) 자동 모드에서 창문을 닫아 둔다
+WEATHER_WAIT_SECONDS = 20.0  # 서버 시작 직후 기상청 첫 조회를 기다리는 최대 시간(초)
 LAT = _env_float("SW_LAT", 37.3281944)   # 기본값: 죽전1동 (기상청 격자 X62, Y122). 다른 곳에 설치하면 바꾸세요
 LON = _env_float("SW_LON", 127.1159222)
 
@@ -139,6 +146,8 @@ state_lock = threading.RLock()
 # 종료 절차 시작을 알리는 이벤트: 켜지면 제어 루프가 끝나고 새 모터 명령이 거부된다
 stop_event = threading.Event()
 control_thread = None
+weather_attempted = threading.Event()  # 기상청 첫 조회(성공/실패 무관)가 끝났음을 알림
+START_TIME = time.time()
 
 system_data = {
     "indoor_temp": 0.0,
@@ -148,12 +157,17 @@ system_data = {
     "outdoor_rain_mm": "--",    # 기상청 1시간 강수량(mm)
     "outdoor_pty_text": "--",   # 기상청 강수형태 (없음/비/비·눈/눈/빗방울 ...)
     "weather_updated": "--",    # 기상청 관측 기준 시각
+    "weather_text": "--",       # 표시용 날씨 문구 (맑음/구름많음/흐림/비/눈 ...)
+    "sky_text": "--",           # 기상청 초단기예보 하늘 상태 (맑음/구름많음/흐림)
     "weather_ok": False,
     "weather_message": "기상청 데이터를 아직 가져오지 못했습니다",
     "dust": 0,              # μg/m³ (변환값)
     "dust_raw": 0,          # ADC 원시값 (보정용)
-    "rain_detected": False,  # 웹 대시보드/자동 제어용 (True/False)
-    "rain_amount": 0,        # 앱 인벤터용 (비 감지 1 / 맑음 0)
+    "rain_detected": False,  # 기상청 기준 강수 여부 (True/False) - 비 센서는 사용하지 않음
+    "rain_amount": 0,        # 앱 인벤터용 (기상청 기준 강수 1 / 없음 0)
+    "rain_known": False,     # 기상청 강수 정보를 확인했는지 (False면 자동 모드에서 창문을 닫아 둠)
+    "dust_level": "--",      # 미세먼지 단계 (좋음/보통/나쁨/매우나쁨)
+    "led_color": "off",      # 미세먼지 LED 색 (blue/green/orange/red)
     "window_state": "UNKNOWN",  # 시작/재연결 직후에는 실제 위치를 모르므로 첫 판단 때 반드시 명령을 보냄
     "moving": False,        # 모터 동작 중 여부
     "fault_alert": 0,
@@ -165,9 +179,10 @@ system_data = {
 move_end_time = 0.0
 last_sensor_ok = 0.0
 last_reconnect = 0.0
+last_weather_ok = 0.0
 
 # 장애 원인을 종류별로 관리: comm = 통신 장애, dht = 온습도 센서 장애, motor = 모터 명령 장애
-fault_reasons = {"comm": None, "dht": None, "motor": None}
+fault_reasons = {"comm": None, "dht": None, "motor": None, "weather": None}
 comm_fail_count = 0
 dht_fail_count = 0
 
@@ -235,6 +250,7 @@ def connect_serial():
         system_data["window_state"] = "UNKNOWN"
         system_data["moving"] = False
     log.info("아두이노 시리얼 연결 성공 (%s)", SERIAL_PORT)
+    reset_led_state()  # 아두이노가 리셋됐을 수 있으니 LED 색을 다시 보낸다
     if not send_motor_checked(b"WINDOW_STOP\n"):
         log.warning("연결 직후 모터 정지 확인 실패")
     return True
@@ -345,14 +361,10 @@ def shutdown_stop():
 
 
 def parse_sensor_line(line):
-    # 형식: TEMP:24.5,HUMI:60.0,RAIN:1,DUST:150
+    # 형식: TEMP:24.5,HUMI:60.0,DUST:150
+    # (예전 스케치가 보내던 RAIN 항목이 섞여 있어도 무시한다 - 비 판단은 기상청으로 한다)
     kv = dict(part.split(':', 1) for part in line.split(','))
-    return (
-        float(kv["TEMP"]),
-        float(kv["HUMI"]),
-        int(kv["RAIN"]),   # 0이면 비 옴, 1이면 맑음
-        int(kv["DUST"]),
-    )
+    return float(kv["TEMP"]), float(kv["HUMI"]), int(kv["DUST"])
 
 
 # -----------------------------------------------------------------
@@ -444,7 +456,7 @@ def comm_fault():
 
 def update_sensor():
     """센서를 읽어 system_data 갱신. 통신에 성공하면 True.
-    DHT만 실패한 경우에도 비/미세먼지는 정상 갱신하고 True를 반환한다."""
+    DHT만 실패한 경우에도 미세먼지는 정상 갱신하고 True를 반환한다."""
     global comm_fail_count, dht_fail_count, last_sensor_ok
 
     if SIMULATE:
@@ -464,7 +476,7 @@ def update_sensor():
         line, err = read_sensor_line()
         if line is None:
             raise RuntimeError(err)
-        temp, humi, rain, dust_raw = parse_sensor_line(line)
+        temp, humi, dust_raw = parse_sensor_line(line)
     except Exception as e:
         comm_fail_count += 1
         log.warning("센서 읽기 실패 (연속 %d회): %s", comm_fail_count, e)
@@ -482,18 +494,16 @@ def update_sensor():
     fault_reasons["comm"] = None
     last_sensor_ok = time.time()
 
-    # --- 비/미세먼지는 DHT와 무관하게 항상 갱신 ---
+    # --- 미세먼지는 DHT와 무관하게 항상 갱신 ---
     system_data["dust_raw"] = dust_raw
     system_data["dust"] = raw_to_ugm3(dust_raw)
-    system_data["rain_detected"] = (rain == 0)
-    system_data["rain_amount"] = 1 if rain == 0 else 0
 
     # --- 온습도(DHT)는 실패 시 이전 값을 유지하고 연속 실패 시에만 알림 ---
     if temp <= DHT_ERROR_THRESHOLD or humi <= DHT_ERROR_THRESHOLD:
         dht_fail_count += 1
         log.warning("DHT 읽기 실패 (연속 %d회)", dht_fail_count)
         if dht_fail_count >= FAIL_LIMIT:
-            fault_reasons["dht"] = "온습도 센서(DHT) 오류 - 비/미세먼지 기준으로만 동작 중"
+            fault_reasons["dht"] = "온습도 센서(DHT) 오류 - 미세먼지/기상청 기준으로만 동작 중"
     else:
         dht_fail_count = 0
         fault_reasons["dht"] = None
@@ -504,15 +514,106 @@ def update_sensor():
     return True
 
 
+# ---- 미세먼지 단계 / LED ----
+# 0~30 파랑(좋음), 31~80 초록(보통), 81~150 주황(나쁨), 151 이상 빨강(매우 나쁨)
+DUST_LEVELS = ((30, "blue", "좋음"), (80, "green", "보통"), (150, "orange", "나쁨"))
+LED_RESEND_SECONDS = 60.0    # 같은 색이어도 이 간격으로 다시 보낸다 (아두이노가 리셋됐을 때 복구)
+LED_RETRY_BACKOFF = 30.0     # LED 명령이 실패하면 이 시간 뒤에 다시 시도
+last_led_color = None
+last_led_time = 0.0
+led_retry_after = 0.0
+
+
+def dust_level(dust):
+    """미세먼지 수치(μg/m³) -> (LED 색, 단계 이름)"""
+    for limit, color, text in DUST_LEVELS:
+        if dust <= limit:
+            return color, text
+    return "red", "매우나쁨"
+
+
+def reset_led_state():
+    global last_led_color, led_retry_after
+    last_led_color = None
+    led_retry_after = 0.0
+
+
+def send_led(color):
+    """아두이노에 LED 색 명령을 보내고 ACK 를 확인한다. (실패해도 모터 장애로 표시하지 않는다)"""
+    cmd = ("LED_" + color.upper()).encode()
+    expected = "LED_" + color.upper() + "_SUCCESS"
+    for _ in range(2):
+        try:
+            with serial_lock:
+                if ser is None:
+                    return False
+                ser.reset_input_buffer()
+                ser.write(cmd + b"\n")
+                ack = ser.readline().decode("utf-8", errors="ignore").strip()
+        except Exception:
+            ack = ""
+        if expected in ack:
+            return True
+    return False
+
+
+def update_led():
+    """현재 미세먼지 수치에 맞는 단계/색을 상태에 반영하고, 바뀌었으면 아두이노 LED에 지시한다."""
+    global last_led_color, last_led_time, led_retry_after
+    color, text = dust_level(system_data["dust"])
+    system_data["dust_level"] = text
+    system_data["led_color"] = color
+    if SIMULATE or ser is None:
+        return
+    now = time.time()
+    if now < led_retry_after:
+        return
+    if color == last_led_color and now - last_led_time < LED_RESEND_SECONDS:
+        return
+    if send_led(color):
+        if color != last_led_color:
+            log.info("미세먼지 %s μg/m³ (%s) -> LED %s", system_data["dust"], text, color)
+        last_led_color, last_led_time = color, now
+    else:
+        led_retry_after = now + LED_RETRY_BACKOFF
+        log.warning("LED 명령 응답 없음 - 아두이노에 최신 smart_window.ino 가 올라가 있는지 확인하세요 (%d초 뒤 재시도)",
+                    LED_RETRY_BACKOFF)
+
+
+# ---- 강수 판단 (기상청) / 자동 제어 ----
+def rain_state():
+    """기상청 기준 강수 여부. True/False, 확인할 수 없으면 None."""
+    if not system_data["rain_known"] or time.time() - last_weather_ok > KMA_STALE_SECONDS:
+        return None
+    return system_data["rain_detected"]
+
+
 def auto_control():
     if comm_fault():
-        # 통신 장애: 오래된 데이터로 판단하지 않고 안전하게 닫는다
+        # 아두이노 통신 장애: 오래된 데이터로 판단하지 않고 안전하게 닫는다
         if FAILSAFE_CLOSE_ON_FAULT:
             move_window("CLOSED")
         return
 
-    if system_data["rain_detected"]:
-        move_window("CLOSED")       # 비: 최우선 방어
+    # 서버를 막 켰다면 기상청 첫 조회가 끝날 때까지 잠깐 기다린다 (시작 직후 열었다 닫았다 하는 것을 막음)
+    if not weather_attempted.is_set() and time.time() - START_TIME < WEATHER_WAIT_SECONDS:
+        return
+
+    rain = rain_state()
+    if rain is None:
+        # 강수 여부를 알 수 없는 상황 (키 없음, 인터넷 끊김, 기상청 장애)
+        if KMA_FAILSAFE_CLOSE:
+            fault_reasons["weather"] = "기상청 강수 정보를 확인할 수 없어 창문을 닫아 둡니다"
+            refresh_fault()
+            move_window("CLOSED")
+            return
+        rain = False
+    elif fault_reasons["weather"]:
+        fault_reasons["weather"] = None
+        refresh_fault()
+
+    if rain:
+        move_window("CLOSED")       # 비(강수): 최우선 방어
     elif system_data["dust"] > system_data["dust_threshold"]:
         move_window("CLOSED")       # 미세먼지 초과
     else:
@@ -527,11 +628,17 @@ def hardware_control_loop():
 
             if not stop_event.is_set() and time.time() >= next_sensor:
                 ok = update_sensor()
+                if ok:
+                    update_led()
                 # 실패하면 정상 주기를 기다리지 않고 더 빨리 재시도 (일시적 오류 복구)
                 next_sensor = time.time() + (SENSOR_INTERVAL if ok else RETRY_INTERVAL)
                 # 최신 데이터가 있거나, 통신 장애가 확정된 경우(페일세이프)에만 자동 제어
-                if system_data["mode"] == "AUTO" and (ok or comm_fault()):
-                    auto_control()
+                if system_data["mode"] == "AUTO":
+                    if ok or comm_fault():
+                        auto_control()
+                elif fault_reasons["weather"]:
+                    fault_reasons["weather"] = None  # 수동 모드에서는 자동 제어 관련 알림을 남기지 않는다
+                    refresh_fault()
         except Exception:
             # 예상 못 한 오류로 제어 스레드가 조용히 죽지 않도록 기록하고 계속 돈다
             log.exception("제어 루프 오류")
@@ -612,8 +719,11 @@ def load_kma_key():
     return key
 
 
-def _parse_kma_body(body):
-    """기상청 응답(JSON 또는 XML)에서 {카테고리: 관측값} 을 꺼낸다."""
+SKY_TEXT = {1: "맑음", 3: "구름많음", 4: "흐림"}   # 초단기예보 SKY 코드
+
+
+def _parse_kma_items(body):
+    """기상청 응답(JSON 또는 XML)에서 항목(dict) 목록을 꺼낸다."""
     text = body.lstrip()
     if text.startswith("{"):
         data = json.loads(text)
@@ -625,9 +735,7 @@ def _parse_kma_body(body):
                 raise KmaAuthError(f"{header.get('resultCode')} {header.get('resultMsg')}")
             raise KmaError(header.get("resultCode"), header.get("resultMsg"))
         items = data["response"]["body"]["items"]["item"]
-        if isinstance(items, dict):  # 항목이 1개일 때 리스트가 아닌 경우 대비
-            items = [items]
-        return {it["category"]: it["obsrValue"] for it in items}
+        return [items] if isinstance(items, dict) else list(items)  # 항목이 1개일 때 dict 로 오는 경우 대비
 
     if text.startswith("<"):
         root = ET.fromstring(text)
@@ -640,19 +748,19 @@ def _parse_kma_body(body):
             if code in AUTH_ERROR_CODES:
                 raise KmaAuthError(f"{code} {root.findtext('.//resultMsg')}")
             raise KmaError(code, root.findtext(".//resultMsg"))
-        return {it.findtext("category"): it.findtext("obsrValue") for it in root.iter("item")}
+        return [{child.tag: (child.text or "") for child in it} for it in root.iter("item")]
 
     raise RuntimeError("기상청 응답을 해석하지 못했습니다: " + " ".join(text[:150].split()))
 
 
-def _kma_request(base_dt, nx, ny, key, source):
-    url_base, auth_name = KMA_ENDPOINTS[source]
+def _kma_request(operation, base_dt, nx, ny, key, source, rows):
+    prefix, auth_name = KMA_ENDPOINTS[source]
     params = {
-        auth_name: key, "pageNo": 1, "numOfRows": 20, "dataType": "JSON",
-        "base_date": base_dt.strftime("%Y%m%d"), "base_time": base_dt.strftime("%H00"),
+        auth_name: key, "pageNo": 1, "numOfRows": rows, "dataType": "JSON",
+        "base_date": base_dt.strftime("%Y%m%d"), "base_time": base_dt.strftime("%H%M"),
         "nx": nx, "ny": ny,
     }
-    url = url_base + "?" + urllib.parse.urlencode(params)  # 주의: url에 인증키가 있으니 로그에 남기지 않는다
+    url = prefix + operation + "?" + urllib.parse.urlencode(params)  # 주의: url에 인증키가 있으니 로그에 남기지 않는다
     try:
         with urllib.request.urlopen(url, timeout=KMA_TIMEOUT) as resp:
             body = resp.read().decode("utf-8", errors="replace")
@@ -664,7 +772,7 @@ def _kma_request(base_dt, nx, ny, key, source):
         if e.code in (401, 403):
             raise KmaAuthError(f"HTTP {e.code} {e.reason} {detail}".strip())
         raise RuntimeError(f"HTTP {e.code} {e.reason} {detail}".strip())
-    return _parse_kma_body(body)
+    return _parse_kma_items(body)
 
 
 def _scrub(text, key):
@@ -675,22 +783,6 @@ def _scrub(text, key):
     return text
 
 
-def fetch_weather(key, source):
-    """초단기실황 조회. 반환: (카테고리->값 dict, 관측 기준 시각)"""
-    now = datetime.now(KST)  # 라즈베리파이 시간대와 무관하게 한국 시간 기준
-    base = now.replace(minute=0, second=0, microsecond=0)
-    if now.minute < 45:
-        base -= timedelta(hours=1)  # 실황은 정시 후 약 40분 뒤에 제공되므로 직전 정시 자료를 쓴다
-    nx, ny = latlon_to_grid(LAT, LON)
-    try:
-        return _kma_request(base, nx, ny, key, source), base
-    except KmaError as e:
-        if e.code != "03":  # 03 = 자료 없음(아직 생성 전)
-            raise
-    base -= timedelta(hours=1)
-    return _kma_request(base, nx, ny, key, source), base
-
-
 def _num(v):
     try:
         x = float(v)
@@ -699,62 +791,141 @@ def _num(v):
     return None if x <= -900 else x  # -999 등은 결측
 
 
-def fetch_weather_any(key):
-    """설정된 발급처 방식(hub/data)으로 먼저 시도하고, 인증 실패면 다른 방식으로 한 번 더 시도한다.
+def fetch_observation(key, source):
+    """초단기실황(기온/습도/강수). 반환: ({카테고리: 값}, 관측 기준 시각)"""
+    now = datetime.now(KST)  # 라즈베리파이 시간대와 무관하게 한국 시간 기준
+    base = now.replace(minute=0, second=0, microsecond=0)
+    if now.minute < 45:
+        base -= timedelta(hours=1)  # 실황은 정시 후 약 40분 뒤에 제공되므로 직전 정시 자료를 쓴다
+    nx, ny = latlon_to_grid(LAT, LON)
+    for attempt in (0, 1):
+        try:
+            items = _kma_request("getUltraSrtNcst", base, nx, ny, key, source, 20)
+            return {it.get("category"): it.get("obsrValue") for it in items}, base
+        except KmaError as e:
+            if e.code != "03" or attempt == 1:  # 03 = 자료 없음(아직 생성 전)
+                raise
+            base -= timedelta(hours=1)
+
+
+def fetch_forecast_now(key, source):
+    """초단기예보에서 가장 가까운 시각의 값(하늘 상태 SKY, 강수 형태 PTY ...). 반환: ({카테고리: 값}, 발표 시각)"""
+    now = datetime.now(KST)
+    base = now.replace(minute=30, second=0, microsecond=0)  # 초단기예보는 매시 30분 발표, 약 15분 뒤 제공
+    if now.minute < 45:
+        base -= timedelta(hours=1)
+    nx, ny = latlon_to_grid(LAT, LON)
+    for attempt in (0, 1):
+        try:
+            items = _kma_request("getUltraSrtFcst", base, nx, ny, key, source, 100)
+            slots = {}
+            for it in items:
+                slots.setdefault((it.get("fcstDate"), it.get("fcstTime")), {})[it.get("category")] = it.get("fcstValue")
+            if not slots:
+                raise RuntimeError("초단기예보 응답에 항목이 없습니다")
+            return slots[min(slots)], base
+        except KmaError as e:
+            if e.code != "03" or attempt == 1:
+                raise
+            base -= timedelta(hours=1)
+
+
+def fetch_weather_bundle(key):
+    """기상청에서 실황(필수)과 하늘 상태(선택)를 가져온다.
+    설정된 발급처 방식(hub/data)으로 먼저 시도하고 인증 실패면 다른 방식으로 한 번 더 시도한다.
     (API허브 키와 공공데이터포털 키는 서로 호환되지 않아, 어느 쪽에서 받았는지 헷갈려도 동작하게 한다.)"""
     global KMA_SOURCE
     errors = []
+    obs = base = None
     for src in [KMA_SOURCE] + [x for x in KMA_ENDPOINTS if x != KMA_SOURCE]:
         try:
-            result = fetch_weather(key, src)
+            obs, base = fetch_observation(key, src)
         except KmaAuthError as e:
             errors.append(f"[{src}] {e}")
             continue
         if src != KMA_SOURCE:
             log.info("인증키가 '%s' 방식에서 인증되었습니다. 이후 이 방식을 사용합니다.", src)
             KMA_SOURCE = src
-        return result
-    raise RuntimeError("인증 실패 - 인증키와 API 신청/승인 상태를 확인하세요. " + " / ".join(errors))
+        break
+    else:
+        raise RuntimeError("인증 실패 - 인증키와 API 신청/승인 상태를 확인하세요. " + " / ".join(errors))
+
+    fcst, fcst_error = None, None
+    try:
+        fcst, _ = fetch_forecast_now(key, KMA_SOURCE)
+    except Exception as e:  # 하늘 상태는 부가 정보이므로 실패해도 실황은 그대로 사용한다
+        fcst_error = _scrub(str(e), key)
+    return {"obs": obs, "obs_base": base, "fcst": fcst, "fcst_error": fcst_error}
 
 
-def update_weather(key):
-    values, base = fetch_weather_any(key)
-    t, h = _num(values.get("T1H")), _num(values.get("REH"))
-    rn, pty = _num(values.get("RN1")), _num(values.get("PTY"))
+def apply_weather(b):
+    """가져온 날씨 정보를 상태에 반영한다 (강수 판단 포함)."""
+    global last_weather_ok
+    obs, fcst = b["obs"], b["fcst"]
+    t, h = _num(obs.get("T1H")), _num(obs.get("REH"))
+    rn, pty = _num(obs.get("RN1")), _num(obs.get("PTY"))
     if t is not None:
         system_data["outdoor_temp"] = round(t, 1)
     if h is not None:
         system_data["outdoor_hum"] = round(h, 1)
     if rn is not None:
         system_data["outdoor_rain_mm"] = rn
-    if pty is not None:
-        system_data["outdoor_pty_text"] = PTY_TEXT.get(int(pty), f"코드{int(pty)}")
-    system_data["weather_updated"] = base.strftime("%Y-%m-%d %H:%M")
+    pty_code = int(pty) if pty is not None else None
+    if pty_code is not None:
+        system_data["outdoor_pty_text"] = PTY_TEXT.get(pty_code, f"코드{pty_code}")
+
+    # 강수 판단: 강수 형태가 '없음'이 아니거나 1시간 강수량이 있으면 강수로 본다 (눈 포함)
+    if pty_code is not None or rn is not None:
+        precip = (pty_code not in (None, 0)) or (rn is not None and rn > 0)
+        system_data["rain_detected"] = precip
+        system_data["rain_amount"] = 1 if precip else 0
+        system_data["rain_known"] = True
+    else:
+        precip = system_data["rain_detected"]
+
+    sky = _num(fcst.get("SKY")) if fcst else None
+    sky_text = SKY_TEXT.get(int(sky), "--") if sky is not None else "--"
+    system_data["sky_text"] = sky_text
+    if precip:
+        system_data["weather_text"] = PTY_TEXT.get(pty_code, "강수") if pty_code else "강수"
+    elif sky_text != "--":
+        system_data["weather_text"] = sky_text
+    else:
+        system_data["weather_text"] = "강수 없음"
+
+    last_weather_ok = time.time()
+    system_data["weather_updated"] = b["obs_base"].strftime("%Y-%m-%d %H:%M")
     system_data["weather_ok"] = True
-    system_data["weather_message"] = ""
-    log.info("기상청 갱신: 기온 %s℃ 습도 %s%% 강수 %s (%s 기준)", t, h,
-             system_data["outdoor_pty_text"], system_data["weather_updated"])
+    system_data["weather_message"] = f"하늘 상태 조회 실패: {b['fcst_error']}" if b["fcst_error"] else ""
+    log.info("기상청 갱신: 기온 %s℃ 습도 %s%% 날씨 %s (강수 %s, 하늘 %s) (%s 기준)", t, h,
+             system_data["weather_text"], system_data["outdoor_pty_text"], sky_text, system_data["weather_updated"])
+
+
+def update_weather(key):
+    apply_weather(fetch_weather_bundle(key))
 
 
 def weather_loop():
     key = load_kma_key()
     if not key:
-        system_data["weather_message"] = "기상청 API 키가 없어 실외 날씨를 가져오지 않습니다 (kma_key.txt 또는 SW_KMA_KEY)"
+        system_data["weather_message"] = "기상청 API 키가 없어 날씨/강수를 가져오지 않습니다 (kma_key.txt 또는 SW_KMA_KEY)"
         log.warning(system_data["weather_message"])
+        weather_attempted.set()
         return
     log.info("기상청 인증키를 읽었습니다 (길이 %d자)", len(key))
-    log.info("기상청 실외 날씨 수집 시작 (발급처: %s): 위도 %.4f 경도 %.4f -> 격자 %s", KMA_SOURCE, LAT, LON, latlon_to_grid(LAT, LON))
+    log.info("기상청 날씨 수집 시작 (발급처: %s): 위도 %.4f 경도 %.4f -> 격자 %s", KMA_SOURCE, LAT, LON, latlon_to_grid(LAT, LON))
     while not stop_event.is_set():
         wait = KMA_INTERVAL
         try:
             update_weather(key)
         except Exception as e:
-            # 실패해도 마지막 값은 유지하고, 상태만 표시한다 (창문 제어에는 영향 없음)
+            # 실패해도 마지막 값은 유지하고 상태만 표시한다. 강수 정보가 오래되면 자동 모드에서 창문을 닫아 둔다
             system_data["weather_ok"] = False
             msg = _scrub(str(e), key)
             system_data["weather_message"] = f"기상청 갱신 실패: {msg}"
             log.warning("기상청 갱신 실패: %s", msg)
             wait = KMA_RETRY_INTERVAL
+        weather_attempted.set()
         stop_event.wait(wait)
 
 
@@ -776,6 +947,7 @@ TEXT_STATUS_FIELDS = ("indoor_temp", "indoor_hum", "outdoor_temp", "outdoor_hum"
 @app.route('/status', methods=['GET'])
 def get_status():
     data = dict(system_data)
+    data["server_version"] = SERVER_VERSION
     for k in TEXT_STATUS_FIELDS:
         if isinstance(data.get(k), float):
             data[k] = f"{data[k]:.1f}"
@@ -794,6 +966,8 @@ def health():
         "last_sensor_age_sec": age,
         "fault_message": system_data["fault_message"],
         "weather_ok": system_data["weather_ok"],
+        "version": SERVER_VERSION,
+        "file": os.path.abspath(__file__),
     }
     return jsonify(body), (200 if alive else 503)
 
@@ -868,6 +1042,7 @@ def _on_sigterm(signum, frame):
 def main():
     global control_thread
 
+    log.info("서버 버전: %s (%s)", SERVER_VERSION, os.path.abspath(__file__))
     load_settings()
     atexit.register(shutdown_stop)
     signal.signal(signal.SIGTERM, _on_sigterm)
@@ -898,4 +1073,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
