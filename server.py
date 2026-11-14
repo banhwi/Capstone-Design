@@ -35,12 +35,12 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 import serial
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 어떤 버전의 코드가 실제로 실행 중인지 확인하는 용도 (시작 로그, /health, /status 에 표시)
-SERVER_VERSION = "2026-11-12-weather-diag"
+SERVER_VERSION = "2026-11-13-sky-fallback"
 
 
 # -----------------------------------------------------------------
@@ -832,6 +832,33 @@ def fetch_forecast_now(key, source):
             base -= timedelta(hours=1)
 
 
+def fetch_vilage_sky(key, source):
+    """단기예보(getVilageFcst)에서 현재 시각에 가장 가까운 예보 값(하늘 상태 SKY 등). 초단기예보가 막혔을 때의 대체 수단.
+    반환: ({카테고리: 값}, 발표 시각)"""
+    now = datetime.now(KST)
+    base = None
+    for hour in (23, 20, 17, 14, 11, 8, 5, 2):   # 02,05,08,11,14,17,20,23시 발표 (약 10분 뒤부터 제공)
+        cand = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if now - cand >= timedelta(minutes=15):
+            base = cand
+            break
+    if base is None:
+        base = (now - timedelta(days=1)).replace(hour=23, minute=0, second=0, microsecond=0)
+    nx, ny = latlon_to_grid(LAT, LON)
+    items = _kma_request("getVilageFcst", base, nx, ny, key, source, 120)
+    slots = {}
+    for it in items:
+        slots.setdefault((it.get("fcstDate"), it.get("fcstTime")), {})[it.get("category")] = it.get("fcstValue")
+    if not slots:
+        raise RuntimeError("단기예보 응답에 항목이 없습니다")
+
+    def distance(k):
+        t = datetime.strptime(k[0] + k[1], "%Y%m%d%H%M").replace(tzinfo=KST)
+        return abs((t - now).total_seconds())
+
+    return slots[min(slots, key=distance)], base
+
+
 def fetch_weather_bundle(key):
     """기상청에서 실황(필수)과 하늘 상태(선택)를 가져온다.
     설정된 발급처 방식(hub/data)으로 먼저 시도하고 인증 실패면 다른 방식으로 한 번 더 시도한다.
@@ -852,7 +879,7 @@ def fetch_weather_bundle(key):
     else:
         raise RuntimeError("인증 실패 - 인증키와 API 신청/승인 상태를 확인하세요. " + " / ".join(errors))
 
-    fcst, fcst_error, fcst_base = None, None, None
+    fcst, fcst_error, fcst_base, sky_source = None, None, None, "초단기예보"
     try:
         fcst, fcst_base = fetch_forecast_now(key, KMA_SOURCE)
     except KmaAuthError as e:
@@ -860,8 +887,16 @@ def fetch_weather_bundle(key):
         fcst_error = _scrub(f"권한 오류 - 인증키로 '초단기예보' API를 쓸 수 있는지(신청/승인) 확인하세요 ({e})", key)
     except Exception as e:  # 하늘 상태는 부가 정보이므로 실패해도 실황은 그대로 사용한다
         fcst_error = _scrub(str(e), key)
-    return {"obs": obs, "obs_base": base, "fcst": fcst, "fcst_error": fcst_error,
-            "fcst_base": fcst_base, "source": KMA_SOURCE}
+
+    if fcst is None:
+        # 대체 수단: 단기예보에서 하늘 상태를 가져온다 (이 API 가 승인돼 있으면 맑음/흐림을 표시할 수 있다)
+        try:
+            fcst, fcst_base = fetch_vilage_sky(key, KMA_SOURCE)
+            sky_source = "단기예보"
+        except Exception as e2:
+            fcst_error = f"{fcst_error} / 대체 수단인 단기예보도 실패: {_scrub(str(e2), key)}"
+    return {"obs": obs, "obs_base": base, "fcst": fcst, "fcst_error": fcst_error if fcst is None else None,
+            "primary_error": fcst_error, "fcst_base": fcst_base, "source": KMA_SOURCE, "sky_source": sky_source}
 
 
 def apply_weather(b):
@@ -909,6 +944,9 @@ def apply_weather(b):
     elif sky_text == "--":
         system_data["weather_message"] = "하늘 상태(SKY) 값이 응답에 없습니다"
         log.warning("초단기예보 응답에 SKY 값이 없습니다 (받은 항목: %s)", sorted((fcst or {}).keys()))
+    elif b.get("sky_source") == "단기예보":
+        system_data["weather_message"] = "초단기예보를 쓸 수 없어 단기예보로 하늘 상태를 가져왔습니다 (초단기예보 신청/승인 확인 권장)"
+        log.warning("초단기예보 실패 -> 단기예보로 하늘 상태를 대체했습니다: %s", b.get("primary_error"))
     else:
         system_data["weather_message"] = ""
     weather_debug.clear()
@@ -919,6 +957,7 @@ def apply_weather(b):
         "fcst_base": b["fcst_base"].strftime("%Y-%m-%d %H:%M") if b.get("fcst_base") else None,
         "fcst_first_slot": {k: fcst.get(k) for k in ("SKY", "PTY", "RN1", "T1H")} if fcst else None,
         "fcst_error": b["fcst_error"],
+        "sky_source": b.get("sky_source") if system_data["sky_ok"] else None,
         "weather_text": system_data["weather_text"],
         "sky_ok": system_data["sky_ok"],
         "updated_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
@@ -980,14 +1019,76 @@ def get_status():
     return jsonify(data)
 
 
+def readable_json(obj, status=200):
+    """진단용 화면: 한글이 \\uXXXX 로 깨지지 않게 UTF-8 로 그대로 내보낸다. (앱용 /status 는 기존 방식 유지)"""
+    return Response(json.dumps(obj, ensure_ascii=False, indent=2), status=status,
+                    mimetype="application/json; charset=utf-8")
+
+
 @app.route('/weather', methods=['GET'])
 def weather_info():
     """날씨 표시가 이상할 때 확인용: 기상청에서 마지막으로 받은 값과 하늘 상태 조회 오류(인증키는 포함되지 않음)."""
-    return jsonify({
+    return readable_json({
         "weather_text": system_data["weather_text"], "sky_text": system_data["sky_text"],
         "sky_ok": system_data["sky_ok"], "weather_ok": system_data["weather_ok"],
         "weather_message": system_data["weather_message"], "rain_known": system_data["rain_known"],
         "kma_source": KMA_SOURCE, "last": weather_debug,
+    })
+
+
+_last_weather_test = 0.0
+
+
+@app.route('/weather/test', methods=['GET'])
+def weather_test():
+    """인증키로 어떤 기상청 API 가 허용되는지 하나씩 호출해 본다 (403 이면 그 API 를 신청/승인해야 한다).
+    기상청 서버를 직접 호출하므로 20초에 한 번만 허용한다."""
+    global _last_weather_test
+    key = load_kma_key()
+    if not key:
+        return readable_json({"error": "기상청 인증키가 없습니다 (kma_key.txt)"}, 400)
+    if time.time() - _last_weather_test < 20:
+        return readable_json({"error": "20초 뒤에 다시 시도하세요"}, 429)
+    _last_weather_test = time.time()
+
+    now = datetime.now(KST)
+    nx, ny = latlon_to_grid(LAT, LON)
+    ncst_base = now.replace(minute=0, second=0, microsecond=0)
+    if now.minute < 45:
+        ncst_base -= timedelta(hours=1)
+    fcst_base = now.replace(minute=30, second=0, microsecond=0)
+    if now.minute < 45:
+        fcst_base -= timedelta(hours=1)
+    # 단기예보는 02,05,08,11,14,17,20,23시에 발표 (발표 후 약 10분 뒤부터 제공)
+    vil_base = None
+    for hour in (23, 20, 17, 14, 11, 8, 5, 2):
+        cand = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if now - cand >= timedelta(minutes=15):
+            vil_base = cand
+            break
+    if vil_base is None:
+        vil_base = (now - timedelta(days=1)).replace(hour=23, minute=0, second=0, microsecond=0)
+
+    tests = (
+        ("초단기실황 (getUltraSrtNcst) - 기온/습도/강수", "getUltraSrtNcst", ncst_base, 20),
+        ("초단기예보 (getUltraSrtFcst) - 하늘 상태", "getUltraSrtFcst", fcst_base, 100),
+        ("단기예보 (getVilageFcst) - 하늘 상태(대체 후보)", "getVilageFcst", vil_base, 300),
+    )
+    results = {}
+    for label, operation, base, rows in tests:
+        try:
+            items = _kma_request(operation, base, nx, ny, key, KMA_SOURCE, rows)
+            results[label] = {"결과": "성공", "받은 항목 수": len(items)}
+        except KmaAuthError as e:
+            results[label] = {"결과": "권한/인증 오류 -> 이 API 를 신청하고 승인(활용중) 상태인지 확인", "상세": _scrub(str(e), key)}
+        except KmaError as e:
+            results[label] = {"결과": f"기상청 응답 코드 {e.code}", "상세": _scrub(str(e), key)}
+        except Exception as e:
+            results[label] = {"결과": "실패", "상세": _scrub(str(e), key)}
+    return readable_json({
+        "kma_source": KMA_SOURCE,
+        "설명": "kma_source 가 hub 면 API허브(apihub.kma.go.kr), data 면 공공데이터포털(data.go.kr)에서 받은 키로 호출 중입니다.",
+        "results": results,
     })
 
 
