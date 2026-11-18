@@ -38,7 +38,7 @@ from logging.handlers import RotatingFileHandler
 from flask import Flask, Response, jsonify, request, send_from_directory
 import serial
 
-BASE_DIR = os.path.dirname(os.path.abspath(file))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 어떤 버전의 코드가 실제로 실행 중인지 확인하는 용도 (시작 로그, /health, /status 에 표시)
 SERVER_VERSION = "2026-11-13-sky-fallback"
 
@@ -131,7 +131,7 @@ if not log.handlers:
 for _name in ("waitress", "werkzeug"):
     logging.getLogger(_name).setLevel(logging.WARNING)  # 1초마다 오는 /status 요청 로그 억제
 
-app = Flask(name)
+app = Flask(__name__)
 
 # -----------------------------------------------------------------
 # 1. 공유 상태
@@ -658,8 +658,8 @@ PTY_TEXT = {0: "없음", 1: "비", 2: "비/눈", 3: "눈", 5: "빗방울", 6: "�
 
 
 class KmaError(Exception):
-    def init(self, code, message):
-        super().init(f"{code} {message}")
+    def __init__(self, code, message):
+        super().__init__(f"{code} {message}")
         self.code = code
 
 
@@ -1105,7 +1105,7 @@ def health():
         "fault_message": system_data["fault_message"],
         "weather_ok": system_data["weather_ok"],
         "version": SERVER_VERSION,
-        "file": os.path.abspath(file),
+        "file": os.path.abspath(__file__),
     }
     return jsonify(body), (200 if alive else 503)
 
@@ -1180,7 +1180,7 @@ def _on_sigterm(signum, frame):
 def main():
     global control_thread
 
-    log.info("서버 버전: %s (%s)", SERVER_VERSION, os.path.abspath(file))
+    log.info("서버 버전: %s (%s)", SERVER_VERSION, os.path.abspath(__file__))
     load_settings()
     atexit.register(shutdown_stop)
     signal.signal(signal.SIGTERM, _on_sigterm)
@@ -1209,5 +1209,5 @@ def main():
         app.run(host=HTTP_HOST, port=HTTP_PORT, debug=False, use_reloader=False, threaded=True)
 
 
-if name == 'main':
+if __name__ == '__main__':
     main()
