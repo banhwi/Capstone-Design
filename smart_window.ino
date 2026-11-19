@@ -9,39 +9,55 @@ const int ENA = 3;
 const int IN1 = 4;
 const int IN2 = 5;
 
-// 빗물 감지 센서 릴레이 모듈 (네오틱스 NS-RSRM)
-// 배선: 모듈 +5V -> 5V, GND -> GND, COM -> GND, NO -> D6
-// 물 감지 시 릴레이가 붙어 D6이 LOW가 되며, 서버로 RAIN:1 전송
-const int RAIN_RELAY_PIN = 6;
-
 // PM2.5 Dust Sensor Pins (GP2Y1023AU0F)
 const int DUST_ANALOG_PIN = A0; // Dust sensor analog output
 const int DUST_LED_PIN = 8;     // Dust sensor internal LED control pin
 const int DUST_SAMPLES = 5;     // 미세먼지는 여러 번 측정해 평균을 보낸다 (잡음 감소)
 
+// 빗물 감지 센서 모듈 (SMG-A 빗물 감지 프로브 & A/D 컨버터 모듈)
+// 배선: VCC -> 5V, GND -> GND, AO -> A1. (DO 는 아날로그 값을 쓰므로 연결하지 않아도 된다)
+// 모듈의 AO 는 마를 때 큰 값(약 1000), 물이 닿으면 작은 값으로 내려간다.
+// 물이 닿았다고 판단하는 기준(임계값)은 서버가 정한다 (server.py 의 RAIN_WET_RAW) - 스케치를 다시 올리지 않고 조정 가능
+const int RAIN_ANALOG_PIN = A1;
+const int RAIN_SAMPLES = 3;         // 여러 번 읽어 평균
+// (선택) 센서 전원을 상시 5V 대신 이 핀으로 공급하면 측정할 때만 켜서 전극 부식을 줄일 수 있다. 5V에 직결하면 -1.
+const int RAIN_POWER_PIN = -1;
+// (선택) 모듈의 DO(디지털 출력)만 연결했다면 true 로 바꾸고 DO 를 RAIN_DIGITAL_PIN 에 연결한다.
+// 이 경우 DO 가 LOW(물 감지)면 0, 아니면 1023 으로 바꿔서 서버에 보낸다.
+const bool RAIN_USE_DIGITAL = false;
+const int RAIN_DIGITAL_PIN = 7;
+
 // 미세먼지 단계 표시용 RGB LED (PWM 가능 핀 + 각 색마다 220Ω 저항)
+// 서버(라즈베리파이)가 미세먼지 수치에 따라 LED_BLUE / LED_GREEN / LED_ORANGE / LED_RED 명령을 보낸다.
 const int LED_R_PIN = 9;
 const int LED_G_PIN = 10;
 const int LED_B_PIN = 11;
 const bool LED_COMMON_ANODE = false;  // 공통 애노드 RGB LED라면 true (공통 캐소드는 false)
 
 // ---------------- 센서 오류 처리 ----------------
+// DHT 읽기 실패/범위 이탈 시 TEMP/HUMI 자리에 보내는 값 (서버의 DHT_ERROR_THRESHOLD와 대응)
 const float SENSOR_ERROR = -999.0;
 
+// 값이 NaN이거나 물리적으로 말이 안 되는 범위면 오류값으로 바꾼다
 float validOrError(float v, float lo, float hi) {
   if (isnan(v) || v < lo || v > hi) return SENSOR_ERROR;
   return v;
 }
 
 // ---------------- 모터 안전장치 ----------------
-const int MOTOR_SPEED = 255;
+const int MOTOR_SPEED = 200;                    // 0~255
+// 서버/라즈베리가 멈춰도 이 시간이 지나면 아두이노가 스스로 모터를 끈다.
+// 서버의 MOVE_SECONDS(기본 54초)보다 최소 5초 이상 길게 설정할 것.
+// (서버의 정지 명령이 재시도/재연결로 몇 초 늦어져도 이 상한이 먼저 걸리지 않도록)
 const unsigned long MAX_RUN_MS = 75000;
+// 이동 중 반대 방향 명령이 오면 먼저 멈추고 이 시간만큼 기다린 뒤 반전 (모터/L298 보호)
 const unsigned long REVERSE_DELAY_MS = 300;
 
 unsigned long motorStart = 0;
 bool motorRunning = false;
-int motorDir = 0;
-int timeoutLockDir = 0;
+int motorDir = 0;         // +1: 열기, -1: 닫기, 0: 정지
+int timeoutLockDir = 0;   // 최대 시간 초과로 멈춘 방향. WINDOW_STOP 또는 반대 방향 명령이 오기 전까지
+                          // 같은 방향 명령은 무시한다 (같은 명령을 반복 전송하는 프로그램이 있어도 구동 시간 제한 유지)
 
 void stopMotor() {
   digitalWrite(IN1, LOW);
@@ -51,16 +67,18 @@ void stopMotor() {
   motorDir = 0;
 }
 
+// 반환: 1 = 새로 시작, 0 = 이미 같은 방향으로 동작 중 (타이머는 연장하지 않음), -1 = 타임아웃 잠금으로 무시
 int startMotor(int dir) {
-  if (dir == timeoutLockDir) return -1;
-  if (motorRunning && motorDir == dir) return 0;
+  if (dir == timeoutLockDir) return -1;          // 시간 초과로 멈춘 방향의 재명령은 무시
+  if (motorRunning && motorDir == dir) return 0; // 같은 방향 반복 명령으로 타이머를 늘리지 않는다
 
+  // 반대 방향으로 이미 돌고 있으면 급반전하지 않고 잠깐 멈췄다가 시작
   if (motorRunning) {
     stopMotor();
     delay(REVERSE_DELAY_MS);
   }
 
-  timeoutLockDir = 0;
+  timeoutLockDir = 0;  // 반대 방향 명령이므로 잠금 해제
   digitalWrite(IN1, dir > 0 ? HIGH : LOW);
   digitalWrite(IN2, dir > 0 ? LOW : HIGH);
   analogWrite(ENA, MOTOR_SPEED);
@@ -70,6 +88,7 @@ int startMotor(int dir) {
   return 1;
 }
 
+// 열기/닫기 명령 처리 후 응답 전송. 서버는 "<명령>_SUCCESS"를 기대한다.
 void handleMove(int dir, const char* name) {
   int r = startMotor(dir);
   Serial.print("ACK: ");
@@ -77,7 +96,7 @@ void handleMove(int dir, const char* name) {
   if (r >= 0) {
     Serial.println("_SUCCESS");
   } else {
-    Serial.println("_IGNORED_TIMEOUT_LOCK");
+    Serial.println("_IGNORED_TIMEOUT_LOCK");  // 시간 초과로 정지한 상태: STOP 또는 반대 명령 필요
   }
 }
 
@@ -99,23 +118,40 @@ void handleLed(const char* name, int r, int g, int b) {
   Serial.println("_SUCCESS");
 }
 
-// ---------------- 센서 측정 ----------------
+// ---------------- 빗물 센서 측정 ----------------
+// 반환: 0~1023 (작을수록 젖음). 서버가 RAIN_WET_RAW 와 비교해 물 감지 여부를 판단한다.
+int readRain() {
+  if (RAIN_USE_DIGITAL) {
+    return digitalRead(RAIN_DIGITAL_PIN) == LOW ? 0 : 1023;
+  }
+  if (RAIN_POWER_PIN >= 0) {
+    digitalWrite(RAIN_POWER_PIN, HIGH);  // 측정하는 동안만 센서 전원을 켠다
+    delay(20);
+  }
+  analogRead(RAIN_ANALOG_PIN);           // 채널 전환 직후의 첫 값은 버린다
+  delay(2);
+  long sum = 0;
+  for (int i = 0; i < RAIN_SAMPLES; i++) {
+    sum += analogRead(RAIN_ANALOG_PIN);
+    delay(2);
+  }
+  if (RAIN_POWER_PIN >= 0) digitalWrite(RAIN_POWER_PIN, LOW);
+  return (int)(sum / RAIN_SAMPLES);
+}
+
+// ---------------- 미세먼지 측정 ----------------
+// 센서 LED를 280µs 켠 시점에 읽는 방식으로 여러 번 측정한 평균(ADC 원시값 0~1023)
 int readDust() {
   long sum = 0;
   for (int i = 0; i < DUST_SAMPLES; i++) {
-    digitalWrite(DUST_LED_PIN, LOW);
+    digitalWrite(DUST_LED_PIN, LOW);  // Power on dust sensor LED
     delayMicroseconds(280);
     sum += analogRead(DUST_ANALOG_PIN);
     delayMicroseconds(40);
-    digitalWrite(DUST_LED_PIN, HIGH);
-    delay(10);
+    digitalWrite(DUST_LED_PIN, HIGH); // Power off dust sensor LED
+    delay(10);                        // 센서 측정 주기(약 10ms)를 맞춘다
   }
   return (int)(sum / DUST_SAMPLES);
-}
-
-// NS-RSRM 릴레이 접점 읽기: 젖음(LOW) -> 1, 마름(HIGH) -> 0 반환
-int readRain() {
-  return (digitalRead(RAIN_RELAY_PIN) == LOW) ? 1 : 0;
 }
 
 void setup() {
@@ -126,55 +162,61 @@ void setup() {
   pinMode(IN2, OUTPUT);
   pinMode(ENA, OUTPUT);
   pinMode(DUST_LED_PIN, OUTPUT);
+  if (RAIN_POWER_PIN >= 0) { pinMode(RAIN_POWER_PIN, OUTPUT); digitalWrite(RAIN_POWER_PIN, LOW); }
+  if (RAIN_USE_DIGITAL) pinMode(RAIN_DIGITAL_PIN, INPUT);
   pinMode(LED_R_PIN, OUTPUT);
   pinMode(LED_G_PIN, OUTPUT);
   pinMode(LED_B_PIN, OUTPUT);
-
-  // NS-RSRM 릴레이 접점용 내부 풀업 입력
-  pinMode(RAIN_RELAY_PIN, INPUT_PULLUP);
-
-  digitalWrite(DUST_LED_PIN, HIGH);
-  stopMotor();
-  setLed(0, 0, 0);
+  digitalWrite(DUST_LED_PIN, HIGH);  // 센서 LED는 평소 꺼 둔다
+  stopMotor();  // 부팅 직후 모터가 도는 일이 없도록 정지 상태로 시작
+  setLed(0, 0, 0);  // 서버가 미세먼지 단계를 알려 줄 때까지 표시 LED는 꺼 둔다
 }
 
 void loop() {
+  // 최대 동작 시간 초과 시 자동 정지 (통신 두절 대비)
   if (motorRunning && (millis() - motorStart > MAX_RUN_MS)) {
-    timeoutLockDir = motorDir;
+    timeoutLockDir = motorDir;  // 이 방향의 재명령은 STOP/반대 명령이 올 때까지 무시
     stopMotor();
     Serial.println("ACK: AUTO_STOP_TIMEOUT");
   }
 
   if (Serial.available() > 0) {
     String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
+    cmd.trim(); // Remove spaces and newline characters
 
+    // 1. Request sensor data (Temp, Humidity, Rain, Dust)
+    //    비 여부는 서버가 빗물 센서 값(RAIN_AD)과 기상청 정보를 함께 보고 판단한다.
     if (cmd == "GET_SENSOR") {
       float h = validOrError(dht.readHumidity(), 0.0, 100.0);
       float t = validOrError(dht.readTemperature(), -40.0, 80.0);
-      int rainVal = readRain();
+      int rainAd = readRain();
       int dustVal = readDust();
 
+      // DHT가 실패해도 미세먼지는 계속 보낸다 (실패한 값만 -999로 표시)
       Serial.print("TEMP:");
       Serial.print(t);
       Serial.print(",HUMI:");
       Serial.print(h);
-      Serial.print(",RAIN:");
-      Serial.print(rainVal);
+      Serial.print(",RAIN_AD:");
+      Serial.print(rainAd);
       Serial.print(",DUST:");
       Serial.println(dustVal);
     }
+    // 2. Open window (motor forward)
     else if (cmd == "WINDOW_OPEN") {
       handleMove(+1, "WINDOW_OPEN");
     }
+    // 3. Close window (motor reverse)
     else if (cmd == "WINDOW_CLOSE") {
       handleMove(-1, "WINDOW_CLOSE");
     }
+    // 4. Stop motor (타임아웃 잠금도 해제)
     else if (cmd == "WINDOW_STOP") {
       stopMotor();
       timeoutLockDir = 0;
       Serial.println("ACK: WINDOW_STOP_SUCCESS");
     }
+    // 5. 미세먼지 단계 LED: 0~30 파랑, 31~80 초록, 81~150 주황, 151 이상 빨강
     else if (cmd == "LED_BLUE")   { handleLed("LED_BLUE",   0,   0, 255); }
     else if (cmd == "LED_GREEN")  { handleLed("LED_GREEN",  0, 255,   0); }
     else if (cmd == "LED_ORANGE") { handleLed("LED_ORANGE", 255, 70,  0); }

@@ -3,7 +3,7 @@
 
 - 라즈베리파이에서 이 파일 하나만 실행합니다. (라즈베리파이 단독 제어 스크립트와 동시 실행 금지)
 - 아두이노와 시리얼로 통신하며 센서값 수집 / 자동 개폐 / 수동 제어 / 웹 대시보드를 제공합니다.
-- 비(강수) 판단은 비 센서가 아니라 기상청 실황으로 하고, 하늘 상태(맑음/흐림)는 기상청 초단기예보로 가져옵니다.
+- 비(강수) 판단은 '빗물 센서가 물을 감지'하거나 '기상청 실황이 강수'이면 비로 봅니다. 하늘 상태(맑음/흐림)는 기상청 초단기예보로 가져옵니다.
 - 미세먼지는 아두이노의 미세먼지 센서로 측정하고, 수치에 따라 LED 색(파랑/초록/주황/빨강)을 아두이노에 지시합니다.
 - 운영 서버(waitress), 로그 파일, 시리얼 자동 재연결, 설정 저장, /health 점검을 포함합니다.
 
@@ -40,7 +40,7 @@ import serial
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 어떤 버전의 코드가 실제로 실행 중인지 확인하는 용도 (시작 로그, /health, /status 에 표시)
-SERVER_VERSION = "2026-11-13-sky-fallback"
+SERVER_VERSION = "2026-11-15-rain-sensor"
 
 
 # -----------------------------------------------------------------
@@ -76,6 +76,15 @@ FAILSAFE_CLOSE_ON_FAULT = True  # 자동 모드에서 '통신 장애' 시 안전
 
 DHT_ERROR_THRESHOLD = -990   # 아두이노가 DHT 실패 시 보내는 -999 판별 기준
 DUST_MIN, DUST_MAX = 10, 100  # 대시보드 슬라이더 범위와 동일
+
+# 빗물 센서(아날로그 값 0~1023, 마를수록 크고 젖을수록 작다). 실제 센서로 측정해 보정하세요.
+#   RAIN_WET_RAW  : 이 값보다 작으면 '물 감지'로 보고 즉시 닫는다
+#   RAIN_DRY_RAW  : 이 값보다 커야 '마름'으로 돌아갈 수 있다 (히스테리시스: 경계값 근처에서 떨리는 것을 막음)
+#   RAIN_CLEAR_SECONDS : 마지막으로 물이 감지된 뒤 이 시간(기본 10분)이 지나야 다시 열 수 있다 (센서 표면이 마르는 시간)
+RAIN_WET_RAW = int(_env_float("SW_RAIN_WET_RAW", 700))
+RAIN_DRY_RAW = int(_env_float("SW_RAIN_DRY_RAW", 800))
+RAIN_CLEAR_SECONDS = _env_float("SW_RAIN_CLEAR_SECONDS", 600.0)
+RAIN_SENSOR_STALE_SECONDS = 30.0   # 센서 값이 이 시간 넘게 오지 않으면 센서 정보를 '알 수 없음'으로 본다
 
 # 기상청 동네예보: 초단기실황(getUltraSrtNcst: 기온/습도/강수) + 초단기예보(getUltraSrtFcst: 하늘 상태)
 # 인증키를 발급받은 곳에 따라 주소와 인증 파라미터 이름이 다르다 (서로의 키는 호환되지 않음)
@@ -164,9 +173,15 @@ system_data = {
     "weather_message": "기상청 데이터를 아직 가져오지 못했습니다",
     "dust": 0,              # μg/m³ (변환값)
     "dust_raw": 0,          # ADC 원시값 (보정용)
-    "rain_detected": False,  # 기상청 기준 강수 여부 (True/False) - 비 센서는 사용하지 않음
-    "rain_amount": 0,        # 앱 인벤터용 (기상청 기준 강수 1 / 없음 0)
-    "rain_known": False,     # 기상청 강수 정보를 확인했는지 (False면 자동 모드에서 창문을 닫아 둠)
+    "rain_detected": False,  # 비 여부(빗물 센서 또는 기상청 중 하나라도 비면 True)
+    "rain_amount": 0,        # 앱 인벤터용 (비 1 / 없음 0)
+    "rain_known": False,     # 비 정보를 확인할 수 있는지 (센서/기상청 둘 다 모르면 False -> 자동 모드에서 창문을 닫아 둠)
+    "rain_source": "--",     # 비라고 판단한 근거: 빗물 센서 / 기상청 / 빗물 센서+기상청 / 없음
+    "rain_kma": False,       # 기상청 기준 강수 여부
+    "rain_kma_known": False,
+    "rain_sensor_ok": False,   # 빗물 센서 값을 받고 있는지
+    "rain_sensor_wet": False,  # 빗물 센서가 물을 감지했는지(마름 판정 전까지 유지)
+    "rain_sensor_raw": "--",   # 빗물 센서 아날로그 값 (0~1023, 마를수록 큼)
     "dust_level": "--",      # 미세먼지 단계 (좋음/보통/나쁨/매우나쁨)
     "led_color": "off",      # 미세먼지 LED 색 (blue/green/orange/red)
     "window_state": "UNKNOWN",  # 시작/재연결 직후에는 실제 위치를 모르므로 첫 판단 때 반드시 명령을 보냄
@@ -182,6 +197,8 @@ move_end_time = 0.0
 last_sensor_ok = 0.0
 last_reconnect = 0.0
 last_weather_ok = 0.0
+last_rain_sensor_time = 0.0
+last_rain_wet_time = 0.0
 
 # 장애 원인을 종류별로 관리: comm = 통신 장애, dht = 온습도 센서 장애, motor = 모터 명령 장애
 fault_reasons = {"comm": None, "dht": None, "motor": None, "weather": None}
@@ -363,10 +380,11 @@ def shutdown_stop():
 
 
 def parse_sensor_line(line):
-    # 형식: TEMP:24.5,HUMI:60.0,DUST:150
-    # (예전 스케치가 보내던 RAIN 항목이 섞여 있어도 무시한다 - 비 판단은 기상청으로 한다)
+    # 형식: TEMP:24.5,HUMI:60.0,RAIN_AD:1023,DUST:150
+    # RAIN_AD = 빗물 센서 아날로그 값. 없으면 None (RAIN_AD 가 없는 예전 스케치). 예전 스케치의 RAIN:0/1 은 의미가 달라 무시한다.
     kv = dict(part.split(':', 1) for part in line.split(','))
-    return float(kv["TEMP"]), float(kv["HUMI"]), int(kv["DUST"])
+    rain = int(kv["RAIN_AD"]) if "RAIN_AD" in kv else None
+    return float(kv["TEMP"]), float(kv["HUMI"]), int(kv["DUST"]), rain
 
 
 # -----------------------------------------------------------------
@@ -478,7 +496,7 @@ def update_sensor():
         line, err = read_sensor_line()
         if line is None:
             raise RuntimeError(err)
-        temp, humi, dust_raw = parse_sensor_line(line)
+        temp, humi, dust_raw, rain_raw = parse_sensor_line(line)
     except Exception as e:
         comm_fail_count += 1
         log.warning("센서 읽기 실패 (연속 %d회): %s", comm_fail_count, e)
@@ -499,6 +517,9 @@ def update_sensor():
     # --- 미세먼지는 DHT와 무관하게 항상 갱신 ---
     system_data["dust_raw"] = dust_raw
     system_data["dust"] = raw_to_ugm3(dust_raw)
+
+    # --- 빗물 센서 (물이 감지되면 바로 '비'로 본다) ---
+    update_rain_sensor(rain_raw)
 
     # --- 온습도(DHT)는 실패 시 이전 값을 유지하고 연속 실패 시에만 알림 ---
     if temp <= DHT_ERROR_THRESHOLD or humi <= DHT_ERROR_THRESHOLD:
@@ -582,12 +603,62 @@ def update_led():
                     LED_RETRY_BACKOFF)
 
 
-# ---- 강수 판단 (기상청) / 자동 제어 ----
-def rain_state():
-    """기상청 기준 강수 여부. True/False, 확인할 수 없으면 None."""
-    if not system_data["rain_known"] or time.time() - last_weather_ok > KMA_STALE_SECONDS:
+# ---- 강수 판단 (빗물 센서 + 기상청) / 자동 제어 ----
+def update_rain_sensor(raw):
+    """빗물 센서 값(0~1023, 마를수록 큼)을 반영한다.
+    RAIN_WET_RAW 미만이면 즉시 '물 감지'. 한 번 감지되면 RAIN_DRY_RAW 를 넘고 RAIN_CLEAR_SECONDS 가 지나야 '마름'으로 돌아간다."""
+    global last_rain_sensor_time, last_rain_wet_time
+    if raw is None:
+        system_data["rain_sensor_ok"] = False  # 빗물 센서 값을 보내지 않는 예전 스케치
+        refresh_rain()
+        return
+    now = time.time()
+    last_rain_sensor_time = now
+    system_data["rain_sensor_ok"] = True
+    system_data["rain_sensor_raw"] = raw
+    if raw < RAIN_WET_RAW:
+        if not system_data["rain_sensor_wet"]:
+            log.info("빗물 센서가 물을 감지했습니다 (값 %d < %d)", raw, RAIN_WET_RAW)
+        system_data["rain_sensor_wet"] = True
+        last_rain_wet_time = now
+    elif system_data["rain_sensor_wet"] and raw > RAIN_DRY_RAW and now - last_rain_wet_time >= RAIN_CLEAR_SECONDS:
+        system_data["rain_sensor_wet"] = False
+        log.info("빗물 센서가 마른 상태로 돌아왔습니다 (값 %d)", raw)
+    refresh_rain()
+
+
+def sensor_rain_state():
+    """빗물 센서 기준: True(물 감지)/False(마름)/None(센서 값을 받지 못함)."""
+    if not system_data["rain_sensor_ok"] or time.time() - last_rain_sensor_time > RAIN_SENSOR_STALE_SECONDS:
         return None
-    return system_data["rain_detected"]
+    return system_data["rain_sensor_wet"]
+
+
+def kma_rain_state():
+    """기상청 기준: True(강수)/False(없음)/None(확인 불가 또는 정보가 오래됨)."""
+    if not system_data["rain_kma_known"] or time.time() - last_weather_ok > KMA_STALE_SECONDS:
+        return None
+    return system_data["rain_kma"]
+
+
+def refresh_rain():
+    """두 정보원을 합쳐 rain_detected / rain_amount / rain_known / rain_source 를 갱신하고 결과를 돌려준다.
+    True = 하나라도 비, False = 확인 가능한 정보원이 모두 '비 아님', None = 두 정보원 모두 알 수 없음."""
+    sensor, kma = sensor_rain_state(), kma_rain_state()
+    detected = (sensor is True) or (kma is True)
+    known = (sensor is not None) or (kma is not None)
+    sources = [name for name, state in (("빗물 센서", sensor), ("기상청", kma)) if state is True]
+    system_data["rain_detected"] = detected
+    system_data["rain_amount"] = 1 if detected else 0
+    system_data["rain_known"] = known
+    system_data["rain_source"] = "+".join(sources) if sources else ("없음" if known else "--")
+    if not known:
+        return None
+    return detected
+
+
+def rain_state():
+    return refresh_rain()
 
 
 def auto_control():
@@ -603,9 +674,9 @@ def auto_control():
 
     rain = rain_state()
     if rain is None:
-        # 강수 여부를 알 수 없는 상황 (키 없음, 인터넷 끊김, 기상청 장애)
+        # 비 여부를 알 수 없는 상황 (빗물 센서 값도 없고, 기상청 키 없음/인터넷 끊김/기상청 장애)
         if KMA_FAILSAFE_CLOSE:
-            fault_reasons["weather"] = "기상청 강수 정보를 확인할 수 없어 창문을 닫아 둡니다"
+            fault_reasons["weather"] = "비 정보(빗물 센서/기상청)를 확인할 수 없어 창문을 닫아 둡니다"
             refresh_fault()
             move_window("CLOSED")
             return
@@ -615,7 +686,7 @@ def auto_control():
         refresh_fault()
 
     if rain:
-        move_window("CLOSED")       # 비(강수): 최우선 방어
+        move_window("CLOSED")       # 비(빗물 센서 감지 또는 기상청 강수): 최우선 방어
     elif system_data["dust"] > system_data["dust_threshold"]:
         move_window("CLOSED")       # 미세먼지 초과
     else:
@@ -918,11 +989,10 @@ def apply_weather(b):
     # 강수 판단: 강수 형태가 '없음'이 아니거나 1시간 강수량이 있으면 강수로 본다 (눈 포함)
     if pty_code is not None or rn is not None:
         precip = (pty_code not in (None, 0)) or (rn is not None and rn > 0)
-        system_data["rain_detected"] = precip
-        system_data["rain_amount"] = 1 if precip else 0
-        system_data["rain_known"] = True
+        system_data["rain_kma"] = precip
+        system_data["rain_kma_known"] = True
     else:
-        precip = system_data["rain_detected"]
+        precip = system_data["rain_kma"]
 
     sky = _num(fcst.get("SKY")) if fcst else None
     sky_text = SKY_TEXT.get(int(sky), "--") if sky is not None else "--"
@@ -936,6 +1006,7 @@ def apply_weather(b):
         system_data["weather_text"] = "강수 없음"
 
     last_weather_ok = time.time()
+    refresh_rain()
     system_data["weather_updated"] = b["obs_base"].strftime("%Y-%m-%d %H:%M")
     system_data["weather_ok"] = True
     if b["fcst_error"]:

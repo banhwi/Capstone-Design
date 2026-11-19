@@ -14,6 +14,10 @@ MOVE_SECONDS="54"            # 창문이 끝까지 열리/닫히는 실측 시�
 LAT="37.3281944"             # 설치 장소 위도 (기상청 격자 변환용, 죽전1동 = 격자 X62, Y122)
 LON="127.1159222"            # 설치 장소 경도
 # 기상청 API 키는 server.py 와 같은 폴더의 kma_key.txt 에 한 줄로 저장하세요 (서비스 파일에 넣지 않음)
+# 빗물 센서 기준값 (0~1023, 마를수록 큰 값). 실제 센서로 측정해 보정하세요. 대시보드의 "빗물 센서 값"으로 확인
+RAIN_WET_RAW="700"           # 이 값보다 작으면 물 감지 -> 창문 닫기
+RAIN_DRY_RAW="800"           # 이 값보다 커야 마름으로 복귀
+RAIN_CLEAR_SECONDS="600"     # 마지막 물 감지 후 이 시간(초)이 지나야 다시 열 수 있음
 # -------------------------------------
 
 SERVICE_NAME="smart-window"
@@ -61,6 +65,9 @@ Environment=SW_SERIAL_PORT=${SERIAL_PORT}
 Environment=SW_MOVE_SECONDS=${MOVE_SECONDS}
 Environment=SW_LAT=${LAT}
 Environment=SW_LON=${LON}
+Environment=SW_RAIN_WET_RAW=${RAIN_WET_RAW}
+Environment=SW_RAIN_DRY_RAW=${RAIN_DRY_RAW}
+Environment=SW_RAIN_CLEAR_SECONDS=${RAIN_CLEAR_SECONDS}
 Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=5
