@@ -43,7 +43,11 @@
             <span class="raw">(원시값 <span id="dustRawDisplay">--</span>)</span>
         </div>
         <div class="sensor-row">
-            🌧️ 강우 상태(기상청 기준): <span id="rainDisplay">--</span>
+            🌧️ 강우 상태(빗물 센서+기상청): <span id="rainDisplay">--</span>
+        </div>
+        <div class="sensor-row">
+            💧 빗물 센서: <span id="rainSensorDisplay">--</span>
+            <span class="raw">(값 <span id="rainRawDisplay">--</span> · 마를수록 큰 값, 물이 닿으면 작아짐)</span>
         </div>
         <br>
         <p>현재 창문 상태: <strong id="stateDisplay" style="font-size: 20px;">알 수 없음</strong>
@@ -117,18 +121,26 @@
                 lvl.style.background = LED_CSS[data.led_color] || "#999";
                 document.getElementById("ledDot").style.background = LED_CSS[data.led_color] || "#ddd";
 
-                // 강우 상태는 비 센서가 아니라 기상청 기준이다
+                // 강우 상태: 빗물 센서가 물을 감지하거나 기상청이 강수이면 '비'로 본다
                 let rainSpan = document.getElementById("rainDisplay");
                 if (data.rain_known !== true) {
-                    rainSpan.innerText = "확인 불가 (기상청 정보 없음 → 자동 모드에서는 창문을 닫아 둠)";
+                    rainSpan.innerText = "확인 불가 (빗물 센서·기상청 정보 없음 → 자동 모드에서는 창문을 닫아 둠)";
                     rainSpan.className = "rain-warning";
                 } else if (data.rain_detected === true) {
-                    rainSpan.innerText = "비 감지됨 🌧️";
+                    rainSpan.innerText = "비 감지됨 🌧️ (" + (data.rain_source || "") + ")";
                     rainSpan.className = "rain-warning";
                 } else {
                     rainSpan.innerText = "강수 없음";
                     rainSpan.className = "";
                 }
+
+                // 빗물 센서 자체 상태 (센서 보정할 때 원시값을 보면서 임계값을 정한다)
+                let sensorText = "센서 값 없음 (스케치/배선 확인)";
+                if (data.rain_sensor_ok) {
+                    sensorText = data.rain_sensor_wet ? "물 감지됨 💧" : "마름";
+                }
+                setText("rainSensorDisplay", sensorText);
+                setText("rainRawDisplay", data.rain_sensor_raw);
 
                 document.getElementById("stateDisplay").innerText =
                     STATE_TEXT[data.window_state] || data.window_state || "알 수 없음";
